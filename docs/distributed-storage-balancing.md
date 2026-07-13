@@ -140,6 +140,27 @@ if 磁盘当前可读写:
 - 磁盘物理迁移到新节点时，`mountedNodeId` 更新，但 `diskSerial` 与历史 `onlineSeconds` 随磁盘延续（由 §11.2 的 disk-id 文件或序列号承载）。
 - 冲突合并规则：同一 `diskSerial` 被多个来源上报时（如迁移瞬间双节点可见），取 `onlineSeconds` 较大者、`mountedNodeId` 取上报最新者——这只是聚合时的取舍，**不改写任何本地值**。
 
+**全局 `disk_stats` 聚合算法**（Coordinator 在每次决策前执行，纯只读）：
+
+```
+disk_stats = {}                              -- 仅存在于 Coordinator 内存
+for 每个可见节点 n 的上报 payload:
+    for 每条上报磁盘 d in n.disks:
+        if d.diskSerial 不在 disk_stats:
+            disk_stats[d.diskSerial] = d        -- 首见，直接采用
+        else:
+            exist = disk_stats[d.diskSerial]
+            merged.onlineSeconds  = max(exist.onlineSeconds, d.onlineSeconds)
+            merged.mountedNodeId  = (d.lastSeenAt > exist.lastSeenAt) ? d.mountedNodeId : exist.mountedNodeId
+            merged.freeBytes      = d.freeBytes  -- 以最新上报者为准（更准）
+            merged.capacityBytes  = d.capacityBytes
+            merged.firstSeenAt    = min(exist.firstSeenAt, d.firstSeenAt)
+disk_stats 据此重算 onlineScore / tier（见 §4.2、§5.1），用于 R1/R2/R3 排序
+```
+
+- 聚合结果**只存在 Coordinator 内存**，不回写任何节点的 `disk` 表；节点本地 `disk.online_seconds` 仍以本机自管值为准。
+- 节点掉线后上报过期：超过 `OFFLINE_SUSPECT_DAYS` 未再上报的磁盘，在聚合视图中标记 `suspect=true`，参与排序时降权（避免把数据调度到长期离线磁盘）。
+
 ---
 
 ## 5. 存储分层与空间分配（R1）
@@ -247,6 +268,27 @@ Coordinator 在每月初（或配置周期）对"上个月"目录执行：
 5. 生成 MigrationPlan[]（整目录粒度），按收益排序，受配额限制（见 §6.6）
 ```
 
+**决策评分公式**（步骤 2/3 判定方向与 §6.6 收益排序共用）：
+
+- 目录"应处层"由 `temperature` 决定：`temp < COLD_TEMP_THR`(0.4) → 冷层；`temp ≥ HOT_TEMP_THR`(0.8) → 热层；否则温层。
+- 若目录当前 `tier` 已等于应处层 → **不迁移**（直接跳过）。
+- 迁移收益 `gain = |tier_rank(应处层) − tier_rank(当前层)| × total_bytes`，其中 `tier_rank`：热=3、温=2、冷=1。`gain` 越大越优先。
+- 下沉方向：当前层比应处层"更热"时下沉（如热→冷，`gain=2×total_bytes`）。
+- 上迁方向：当前层比应处层"更冷"且 `accessScore` 近期上升时上迁（冷→热）。
+- `MigrationPlan[]` 按 `gain` 降序排列；单周期内只取 `gain` 字节累计 ≤ `MIGRATION_BYTES_PER_CYCLE`（§14）的前若干条。
+
+**目标磁盘选择**（对每条计划）：
+
+```
+目标层 = 应处层
+候选 = 目标层内、通过 §6.3 空间预检、且当前在线的磁盘
+if 候选非空:
+    选 onlineScore 最高者（最可靠优先）
+else:
+    放宽到相邻层（热↔温、温↔冷）重新做空间预检筛选，仍无 → 放弃该计划并告警
+注：不得选源目录所在 diskSerial（避免同盘搬移无意义）
+```
+
 ### 6.5 迁移执行（先整目录复制后删除）
 
 ```
@@ -305,6 +347,21 @@ for each asset (未删除):
         标记 asset 为 UNDER_REPLICATED
         选择新目标磁盘（满足反亲和 + 有空间 + 在线）
         生成补副本任务（优先级高于均衡迁移）
+```
+
+**补副本目标磁盘选择算法**（满足 R3 反亲和与层分布）：
+
+```
+候选 = 所有 last_seen_at 在 OFFLINE_SUSPECT_DAYS 内（近期可见）的磁盘
+排除：
+  - 已持有该 asset 任一副本的 diskSerial（反亲和：同盘不重复）
+  - freeBytes < asset.size × (1 + SAFETY_MARGIN)（空间不足）
+  - 若现有副本都在同一节点，则优先排除该节点（尽量跨节点）
+按优先级打分选 1 块：
+  1) 层分布加分：现有副本在热/温层时，冷层磁盘 +2 分（鼓励 1 热 + 1 冷）
+  2) onlineScore 降序优先（高可靠磁盘放主副本）
+  3) freeBytes 充裕者优先
+取最高分磁盘；若无任何候选 → 标记 AT_RISK + 告警，等磁盘恢复/接入后重试
 ```
 
 - **副本不足优先级最高**：先补副本，再谈均衡（R1/R2）。
@@ -523,10 +580,33 @@ CREATE INDEX idx_directory_disk ON directory(disk_serial);
 
 ## 10. Coordinator 选举
 
-- 采用**最高在线评分优先**的简单选举：`onlineScore` 最高且当前在线的节点成为 Coordinator（平票用 `serverId` 字典序）。
-- 每个节点通过按需拉取感知谁是 Coordinator；Coordinator 连续 N 次（`COORD_TIMEOUT`）拉取不可达即触发重新选举。
-- Coordinator 无状态可重建：决策所需的全局视图由各节点状态按需拉取聚合，故障漂移不丢数据。
-- 也支持"无 Coordinator"降级：每个节点仅保证本机相关 asset 的副本数（弱化的 R3），暂停全局均衡。
+选举原则：**最高在线评分优先**（`onlineScore` 最高且在线的节点当选，平票用 `serverId` 字典序）。Coordinator **无状态**：它不持久化任何全局数据，决策所需的全局视图每次都由各节点状态按需拉取后聚合得到，因此故障漂移不丢数据。
+
+### 10.1 触发时机
+- **集群首次组建**：有 ≥2 个节点互相发现后，立即触发一次选举。
+- **Coordinator 失联**：任何节点按 §10.2 判定 Coordinator 不可达，且自身满足候选资格（§10.3）时，触发重选。
+- **Coordinator 主动让贤**：当 Coordinator 自身 `onlineScore` 跌出可见成员前 2 名（如本机磁盘大量离线/关机），主动发起重选，避免长时间由低可靠节点主导。
+
+### 10.2 故障检测与角色漂移
+- 每个节点以固定周期 `PULL_INTERVAL`（默认 60s）向当前已知 Coordinator 发 `GET /api/cluster/state`（或被 Coordinator 反向拉取）。
+- 连续 `COORD_TIMEOUT`（默认 3×PULL_INTERVAL）内**所有**尝试都不可达 → 判定 Coordinator 失联。
+- 失联后进入"选举窗口"：各节点计算自身 `onlineScore` 在当前可见成员中的排名，仅当自身为**最高（或并列最高且 `serverId` 最小）**时，才自宣为 Coordinator 并广播 `clusterRole: coordinator`（写入 UDP 发现响应，§9.3）。
+- 漂移是**最终一致**的：其他节点在下次发现/拉取中看到新 `clusterRole` 即更新本地认知，无需投票协议。
+
+### 10.3 候选资格与首选
+- 候选节点须同时满足：自身在线、至少持有 1 块可读写磁盘、最近一个周期内成功上报过状态。
+- 首轮选举（集群组建）：取当前可见成员中 `onlineScore` 最高者；相等取 `serverId` 字典序最小者。
+- 为避免"开机瞬间抖动"导致频繁易主，新当选者设 `COORD_GRACE`（默认 2×PULL_INTERVAL）冷静期，期间不触发让贤/重选。
+
+### 10.4 脑裂处理（详见 §13）
+- 网络分区导致两节点同时自宣 Coordinator 时，以 `onlineScore` 高者为准，低者**主动退让**（将自身 `clusterRole` 改为 `member`，丢弃未下发的决策）。
+- 所有迁移/副本任务带 `coordinatorEpoch`（单调自增）+ 幂等 `taskId`，退让方已下发的任务若未被执行，由胜出方按 `taskId` 去重后重排，避免重复迁移。
+
+### 10.5 降级模式（无 Coordinator）
+- 当集群成员 ≤1，或选举窗口内无节点满足候选资格 → 进入降级：
+  - 各节点**仅保证本机持有的 asset 副本数**（弱化的 R3）：若本机某 asset 仅 1 份且集群内无法补，标记 `AT_RISK` 并本地告警；
+  - **暂停全局均衡**（迁移 R1/R2 停止），避免无协调者时重复/冲突决策；
+  - 一旦 Coordinator 恢复或新节点加入满足候选，自动退出降级并补跑一次评估。
 
 ---
 
@@ -547,7 +627,41 @@ CREATE INDEX idx_directory_disk ON directory(disk_serial);
 2. 在该磁盘存储根写入 `.immich-disk-id` 文件，内含随机生成的稳定 UUID，作为逻辑"磁盘序列号"。
 3. 该 disk-id 随磁盘物理迁移而延续（因为文件在磁盘上），满足 R4 的"跟随磁盘"语义。
 
-> 逻辑 disk-id 的缺点：磁盘格式化会丢失。可在文档标注为已知限制。
+**`.immich-disk-id` 文件格式**（JSON，落于磁盘存储根，如 `Documents/Immich/.immich-disk-id`）：
+
+```json
+{
+  "diskId": "9f1c2e3a-4b5d-6e7f-8a9b-0c1d2e3f4a5b",
+  "generatedAt": 1770000000000,
+  "hostNodeId": "550e8400-...",
+  "label": ""
+}
+```
+
+- `diskId`：随机 UUID（v4），一次性生成后**不再更改**（除非磁盘格式化）。
+- `hostNodeId`：首次生成该文件的节点 `serverId`，供排查；磁盘迁移到新节点时**不修改**（保留出处），节点侧仅更新 `disk.mounted_node_id`。
+- 生成时机：节点首次挂载该磁盘且拿不到真实序列号时，先检查根目录是否已存在 `.immich-disk-id`，**存在则复用（认领），不存在才生成**。
+
+> 逻辑 disk-id 的缺点：磁盘格式化会丢失（已知限制，见 §17）。
+
+### 11.3 磁盘认领流程（跨节点拔插）
+
+新节点挂载一块"已有数据"的磁盘时，按以下顺序认领，使本机 `disk` 表与全局元数据对齐：
+
+```
+1. 读磁盘根 .immich-disk-id（或硬件序列号）→ 得到 diskSerial
+2. 若本机 disk 表无该 diskSerial：
+     - 新建 disk 记录，onlineSeconds 从 0 开始（历史累计值由磁盘上的 .immich-dir.json / 旧节点上报延续，见 §4.3 冲突合并）
+     - 扫描每个月份目录的 .immich-dir.json，批量登记 replica（含 checksum、size、replicaOn）
+     - 重建 directory 表对应行（聚合自 .immich-dir.json）
+3. 更新 disk.mounted_node_id = 本机 serverId
+4. 向 Coordinator 上报认领结果（state 接口）；
+   Coordinator 在聚合时按 §4.3 规则合并在线统计，不回写本机值
+5. 认领完成后，该磁盘参与分层/副本/迁移决策
+```
+
+- 认领是**增量、可重入**的：重复挂载同一磁盘不会重复建表，仅刷新 `mounted_node_id` 与缺失的 replica。
+- 若磁盘被两个节点短暂同时可见（迁移瞬间），以"先完成认领并上报者"为归属；另一方在收到 Coordinator 聚合视图后自动退让该磁盘的归属声明。
 
 ---
 
@@ -603,13 +717,16 @@ CREATE INDEX idx_directory_disk ON directory(disk_serial);
 | 配置 | 默认 | 说明 |
 |------|------|------|
 | `MIN_REPLICAS` | 2 | 最小副本数 |
-| `COORD_TIMEOUT` | 3×拉取周期 | Coordinator 连续不可达判定离线并重选 |
-| `HOT_SCORE_THRESHOLD` | 0.8 | 热层阈值 |
-| `COLD_SCORE_THRESHOLD` | 0.4 | 冷层阈值 |
+| `COORD_TIMEOUT` | 3×`PULL_INTERVAL` | Coordinator 连续不可达判定离线并重选 |
+| `PULL_INTERVAL` | 60s | 状态拉取周期（§10.2 故障检测基准） |
+| `COORD_GRACE` | 2×`PULL_INTERVAL` | 新当选者冷静期，期间不触发让贤/重选 |
+| `HOT_SCORE_THRESHOLD` | 0.8 | 热层阈值（亦作 `HOT_TEMP_THR`，§6.4 上迁判定） |
+| `COLD_SCORE_THRESHOLD` | 0.4 | 冷层阈值（亦作 `COLD_TEMP_THR`，§6.4 下沉判定） |
 | `HOT_FREE_TARGET` | 40% | 热层目标空闲率 |
-| `MIGRATION_BYTES_PER_CYCLE` | 可配 | 每周期迁移配额 |
+| `SAFETY_MARGIN` | 10% | 空间预检/补副本余量（§6.3、§7.2） |
+| `MIGRATION_BYTES_PER_CYCLE` | 可配 | 每周期迁移配额（§6.4 收益排序上限） |
 | `TEMP_WEIGHTS` | 0.4/0.5/0.1 | 温度权重 w1/w2/w3 |
-| `OFFLINE_SUSPECT_DAYS` | 30 | 磁盘离线多久视为可疑 |
+| `OFFLINE_SUSPECT_DAYS` | 30 | 磁盘离线多久视为可疑/掉线降权 |
 
 ---
 
