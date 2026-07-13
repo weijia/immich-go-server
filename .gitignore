@@ -1,0 +1,18 @@
+# Binaries
+/immich-go-server
+*.exe
+
+# Vendor
+/vendor/
+
+# IDE
+.idea/
+.vscode/
+
+# Env / secrets
+.env
+
+# Runtime data
+/data/
+*.db
+*.db-journal
