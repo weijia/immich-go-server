@@ -137,10 +137,12 @@ func CanDeleteSource(dirAssets []model.Asset, effectiveReplicas map[string]int, 
 	return true
 }
 
-// RollbackTargets 返回回滚/失败时必须清理的目标盘残留（§6.5.2）：清单文件本身 + 所有 partial 半成品。
+// RollbackTargets 返回回滚/失败时必须清理的目标盘残留（§6.5.2）：清单文件本身 + 全部已拷文件
+// （completed 与 partial）。源始终保留，目标副本被整体丢弃以避免孤儿/陈旧文件。
 // 清理失败不阻塞回滚（源安全优先）。
 func RollbackTargets(m Manifest, manifestPath string) []string {
 	out := []string{manifestPath}
+	out = append(out, m.Completed...)
 	for assetID := range m.Partial {
 		out = append(out, assetID)
 	}

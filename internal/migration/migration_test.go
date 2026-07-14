@@ -84,14 +84,22 @@ func TestCanDeleteSource(t *testing.T) {
 
 func TestRollbackTargets(t *testing.T) {
 	m := Manifest{
-		Partial: map[string]int64{"a3": 73, "a9": 10},
+		Completed: []string{"a1"},
+		Partial:   map[string]int64{"a3": 73, "a9": 10},
 	}
 	got := RollbackTargets(m, "/disk/.x.migrating.json")
-	// manifest + 2 partials
-	if len(got) != 3 {
-		t.Fatalf("expected 3 cleanup targets, got %d: %v", len(got), got)
+	// manifest + 1 completed + 2 partials
+	if len(got) != 4 {
+		t.Fatalf("expected 4 cleanup targets, got %d: %v", len(got), got)
 	}
 	if got[0] != "/disk/.x.migrating.json" {
 		t.Errorf("manifest path should be first, got %s", got[0])
+	}
+	has := map[string]bool{}
+	for _, g := range got {
+		has[g] = true
+	}
+	if !has["a1"] || !has["a3"] || !has["a9"] {
+		t.Errorf("missing completed/partial targets: %v", got)
 	}
 }
