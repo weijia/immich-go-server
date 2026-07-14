@@ -55,6 +55,12 @@ CREATE TABLE IF NOT EXISTS directory (
   total_bytes  INTEGER,
   access_score REAL
 );
+CREATE TABLE IF NOT EXISTS asset (
+  asset_id   TEXT PRIMARY KEY,
+  size_bytes INTEGER,
+  checksum   TEXT,
+  dir_key    TEXT
+);
 CREATE TABLE IF NOT EXISTS task (
   task_id   TEXT PRIMARY KEY,
   type      TEXT,
@@ -243,7 +249,60 @@ func (s *Store) ListDirectories() ([]model.Directory, error) {
 	return out, nil
 }
 
+// ---- asset (§8) ----
+
+// SaveAsset 记录一个资产（size/checksum/dir_key）。
+func (s *Store) SaveAsset(a model.Asset) error {
+	_, err := s.db.Exec(`INSERT INTO asset (asset_id,size_bytes,checksum,dir_key) VALUES (?,?,?,?)
+ON CONFLICT(asset_id) DO UPDATE SET size_bytes=excluded.size_bytes, checksum=excluded.checksum, dir_key=excluded.dir_key`,
+		a.AssetID, a.SizeBytes, a.Checksum, a.DirKey)
+	return err
+}
+
+// ListAssets 返回所有资产。
+func (s *Store) ListAssets() ([]model.Asset, error) {
+	rows, err := s.db.Query(`SELECT asset_id,size_bytes,checksum,dir_key FROM asset`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []model.Asset
+	for rows.Next() {
+		var a model.Asset
+		if err := rows.Scan(&a.AssetID, &a.SizeBytes, &a.Checksum, &a.DirKey); err != nil {
+			return nil, err
+		}
+		out = append(out, a)
+	}
+	return out, nil
+}
+
+// ReplicaCount 返回某 asset 的健康（非可疑盘）副本数（§6.5.2 有效副本）。
+func (s *Store) ReplicaCount(assetID string) int {
+	n, _ := s.CountHealthyReplicas(assetID)
+	return n
+}
+
 // ---- task (§9.2) ----
+
+// ListTasks 返回所有已记录任务（用于验证 Coordinator 产出）。
+func (s *Store) ListTasks() ([]clusterapi.Task, error) {
+	rows, err := s.db.Query(`SELECT task_id,type,dir_key,asset_id,src_disk,dst_disk,status FROM task`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []clusterapi.Task
+	for rows.Next() {
+		var t clusterapi.Task
+		var status string
+		if err := rows.Scan(&t.TaskID, &t.Type, &t.DirKey, &t.AssetID, &t.SrcDisk, &t.DstDisk, &status); err != nil {
+			return nil, err
+		}
+		out = append(out, t)
+	}
+	return out, nil
+}
 
 // SubmitTask 记录一条集群任务；同一 task_id 幂等（INSERT OR IGNORE）。
 func (s *Store) SubmitTask(task clusterapi.Task) error {
