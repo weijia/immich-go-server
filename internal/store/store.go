@@ -411,6 +411,13 @@ func (s *Store) UpdateDirectoryDisk(dirKey, diskSerial string) error {
 	return err
 }
 
+// RelinquishDirectory 删除本地目录聚合记录（§9.x 目录跨节点重宿主）：
+// 当目录数据已迁到他节点后，源节点应放弃其陈旧的目录视图。
+func (s *Store) RelinquishDirectory(dirKey string) error {
+	_, err := s.db.Exec(`DELETE FROM directory WHERE dir_key=?`, dirKey)
+	return err
+}
+
 // SubmitTask 记录一条集群任务；同一 task_id 幂等（INSERT OR IGNORE）。
 func (s *Store) SubmitTask(task clusterapi.Task) error {
 	_, err := s.db.Exec(`INSERT OR IGNORE INTO task (task_id,type,dir_key,asset_id,src_disk,dst_disk,created_at,status)

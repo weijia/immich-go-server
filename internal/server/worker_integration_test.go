@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/weijia/immich-go-server/internal/cluster"
 	"github.com/weijia/immich-go-server/internal/clusterapi"
 	"github.com/weijia/immich-go-server/internal/config"
 	"github.com/weijia/immich-go-server/internal/coordinator"
@@ -70,11 +71,9 @@ func TestNodeWorkerCrossNode(t *testing.T) {
 		}
 	}
 
-	// --- 节点 B：持有目标盘 DB；预置目录/资产元数据（联邦下副本目录会同步） ---
+	// --- 节点 B：持有目标盘 DB；预置资产元数据（联邦下副本目录会同步）但不预置目录记录，
+	//     以诚实验证“目录跨节点重宿主”——B 需从 A 拉取目录元数据并领养，再让 A 放弃旧记录。 ---
 	if err := b.Store().SaveDisk(model.Disk{DiskSerial: "DB", Tier: model.TierHot, MountedNodeID: "B", OnlineSeconds: 100, FreeBytes: 90 << 30}); err != nil {
-		t.Fatal(err)
-	}
-	if err := b.Store().SaveDirectory(model.Directory{DirKey: "d1", NodeID: "A", DiskSerial: "DA", Tier: model.TierWarm, Temperature: 0.9, TotalBytes: 100}); err != nil {
 		t.Fatal(err)
 	}
 	for _, id := range []string{"a1", "a2"} {
@@ -134,15 +133,22 @@ func TestNodeWorkerCrossNode(t *testing.T) {
 			t.Errorf("B missing HEALTHY replica of %s on DB: %+v", id, reps)
 		}
 	}
-	// 断言 3：B 的目录 d1 归属盘已更新为 DB
+	// 断言 3：B 已领养目录 d1 为权威记录（node_id=B、归属盘=DB）
 	dir, ok, _ := b.Store().GetDirectory("d1")
 	if !ok {
-		t.Fatal("B directory d1 missing")
+		t.Fatal("B directory d1 missing after rehost")
+	}
+	if dir.NodeID != "B" {
+		t.Errorf("B directory d1 nodeId = %s, want B", dir.NodeID)
 	}
 	if dir.DiskSerial != "DB" {
 		t.Errorf("B directory d1 disk = %s, want DB", dir.DiskSerial)
 	}
-	// 断言 4：任务在 B 已标记为 DONE
+	// 断言 4：源节点 A 已放弃陈旧目录记录（跨节点重宿主）
+	if _, ok, _ := a.Store().GetDirectory("d1"); ok {
+		t.Errorf("A still has stale directory d1 after rehost")
+	}
+	// 断言 5：任务在 B 已标记为 DONE
 	tasks, _ := b.Store().ListTasks()
 	if len(tasks) != 1 || tasks[0].Status != "DONE" {
 		t.Fatalf("B task status unexpected: %+v", tasks)
@@ -219,5 +225,55 @@ func TestNodeWorkerReplica(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("B missing HEALTHY replica a3 on DB: %+v", reps)
+	}
+}
+
+// TestNodeDirectoryRehostAPI 直接验证目录重宿主的两个集群端点：
+//  1. GET  /api/cluster/directory/<dirKey> 能拉取目录元数据，对缺失目录返回 404（ok=false）；
+//  2. POST /api/cluster/directory/rehost 让源节点放弃其陈旧目录记录（数据已迁走）。
+func TestNodeDirectoryRehostAPI(t *testing.T) {
+	a := newNodeWith(t, "A")
+	defer a.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = a.Run(ctx) }()
+	addrA := waitAddr(t, a)
+
+	if err := a.Store().SaveDirectory(model.Directory{DirKey: "d9", NodeID: "A", DiskSerial: "DA", Tier: model.TierWarm, Temperature: 0.5, TotalBytes: 42}); err != nil {
+		t.Fatal(err)
+	}
+
+	client := cluster.NewClient("B", "sec", 300)
+
+	// 拉取存在的目录
+	got, ok, err := client.GetDirectory(ctx, "http://"+addrA, "d9")
+	if err != nil {
+		t.Fatalf("GetDirectory: %v", err)
+	}
+	if !ok {
+		t.Fatal("expected d9 on A")
+	}
+	if got.DiskSerial != "DA" || got.TotalBytes != 42 {
+		t.Errorf("unexpected directory: %+v", got)
+	}
+
+	// 拉取缺失目录返回 404 / ok=false
+	if _, ok, err := client.GetDirectory(ctx, "http://"+addrA, "missing"); err != nil {
+		t.Fatalf("GetDirectory missing: %v", err)
+	} else if ok {
+		t.Error("expected missing directory to be not found")
+	}
+
+	// 重宿主：通知 A 放弃 d9
+	if err := client.RehostDirectory(ctx, "http://"+addrA, "d9", "A"); err != nil {
+		t.Fatalf("RehostDirectory: %v", err)
+	}
+	if _, ok, _ := a.Store().GetDirectory("d9"); ok {
+		t.Error("A should have relinquished directory d9")
+	}
+
+	// 非源节点收到同一请求应忽略（幂等对称）：用 B 当源节点，A 不应受影响（已无记录）
+	if err := client.RehostDirectory(ctx, "http://"+addrA, "d9", "B"); err != nil {
+		t.Fatalf("RehostDirectory (no-op): %v", err)
 	}
 }

@@ -13,6 +13,12 @@ import (
 	"github.com/weijia/immich-go-server/internal/model"
 )
 
+// noopGetDirectory 满足 clusterapi.StateProvider 的目录方法（本测试不关心目录重宿主）。
+func (noopProvider) GetDirectory(string) (model.Directory, bool, error) {
+	return model.Directory{}, false, nil
+}
+func (noopProvider) RelinquishDirectory(string) error { return nil }
+
 const (
 	remoteTestNode   = "node-A"
 	remoteTestSecret = "shared-cluster-secret"

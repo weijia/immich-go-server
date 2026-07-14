@@ -28,7 +28,7 @@ type Repo interface {
 	GetAsset(assetID string) (model.Asset, bool, error)
 	ListReplicas(assetID string) ([]model.Replica, error)
 	AddReplica(r model.Replica) error
-	UpdateDirectoryDisk(dirKey, diskSerial string) error
+	SaveDirectory(dir model.Directory) error // 目录重宿主：领养权威记录
 	GetDiskLocation(serial string) (string, bool)
 }
 
@@ -82,24 +82,46 @@ func (w *Worker) execute(ctx context.Context, t clusterapi.Task) error {
 
 // runMigration 把目录下所有资产从 SrcDisk 搬到本节点 DstDisk。
 // 源在本节点则无需字节搬运（仅更新元数据）；源在远端则经 RemoteSource 拉取。
+// 完成后把目录重宿主到本节点（领养权威记录 + 通知源节点放弃旧记录）。
 func (w *Worker) runMigration(ctx context.Context, t clusterapi.Task) error {
-	if _, ok, err := w.Repo.GetDirectory(t.DirKey); err != nil {
+	// 源盘挂载节点（用于跨节点拉取字节与重宿主通知）。
+	srcNode, _ := w.Loc.DiskNode(t.SrcDisk)
+
+	// 取权威目录元数据：优先本地；本地缺失（目录已在源节点）则从源节点拉取。
+	dir, ok, err := w.Repo.GetDirectory(t.DirKey)
+	if err != nil {
 		return err
-	} else if !ok {
-		return fmt.Errorf("directory %s not found", t.DirKey)
 	}
+	if !ok {
+		if srcNode != "" && srcNode != w.NodeID {
+			url, ok := w.Loc.PeerURL(srcNode)
+			if !ok {
+				return fmt.Errorf("no peer url for src node %s", srcNode)
+			}
+			dir, ok, err = w.Client.GetDirectory(ctx, url, t.DirKey)
+			if err != nil {
+				return err
+			}
+			if !ok {
+				return fmt.Errorf("directory %s not found on source node %s", t.DirKey, srcNode)
+			}
+		} else {
+			return fmt.Errorf("directory %s not found", t.DirKey)
+		}
+	}
+
 	assets, err := w.Repo.ListAssetsByDir(t.DirKey)
 	if err != nil {
 		return err
 	}
 	if len(assets) == 0 {
-		// 空目录：直接更新归属盘
-		return w.Repo.UpdateDirectoryDisk(t.DirKey, t.DstDisk)
+		// 空目录：仅重宿主元数据
+		return w.rehost(ctx, t, dir, srcNode)
 	}
 	if err := w.copyAssets(t.SrcDisk, t.DstDisk, assets); err != nil {
 		return err
 	}
-	// 登记目标副本（HEALTHY）并更新目录归属盘
+	// 登记目标副本（HEALTHY）
 	for _, a := range assets {
 		if err := w.Repo.AddReplica(model.Replica{
 			ReplicaID:  a.AssetID + "@" + t.DstDisk,
@@ -112,7 +134,28 @@ func (w *Worker) runMigration(ctx context.Context, t clusterapi.Task) error {
 			return err
 		}
 	}
-	return w.Repo.UpdateDirectoryDisk(t.DirKey, t.DstDisk)
+	return w.rehost(ctx, t, dir, srcNode)
+}
+
+// rehost 把目录的权威记录重宿主到本节点（目标盘所在节点）：
+//  1. 本地领养：把目录记录的 node_id/disk_serial 更新为本节点与 DstDisk，保留其余元数据；
+//  2. 若源节点非本节点，通知其放弃（删除）陈旧的源目录记录。
+func (w *Worker) rehost(ctx context.Context, t clusterapi.Task, dir model.Directory, srcNode string) error {
+	dir.NodeID = w.NodeID
+	dir.DiskSerial = t.DstDisk
+	if err := w.Repo.SaveDirectory(dir); err != nil {
+		return err
+	}
+	if srcNode != "" && srcNode != w.NodeID {
+		url, ok := w.Loc.PeerURL(srcNode)
+		if !ok {
+			return fmt.Errorf("no peer url for src node %s", srcNode)
+		}
+		if err := w.Client.RehostDirectory(ctx, url, t.DirKey, srcNode); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // runReplica 为某资产在本地 DstDisk 补一份副本；源取一份健康副本所在盘（本节点或远端）。

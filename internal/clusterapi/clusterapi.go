@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/weijia/immich-go-server/internal/crypto"
+	"github.com/weijia/immich-go-server/internal/model"
 )
 
 // StatePayload 对应 §9.1 集群状态拉取响应；Signature 由 SignPayload 计算（§9.5）。
@@ -43,12 +44,52 @@ type Task struct {
 	Status  string `json:"status,omitempty"` // QUEUED | RUNNING | DONE | FAILED
 }
 
+// DirectoryDTO 目录聚合元数据的线上传输结构（§9.x 目录跨节点重宿主）：
+// 目标节点在本地无目录记录时从源节点拉取，领养为权威记录。
+type DirectoryDTO struct {
+	DirKey      string  `json:"dirKey"`
+	NodeID      string  `json:"nodeId"`
+	DiskSerial  string  `json:"diskSerial"`
+	Tier        string  `json:"tier"`
+	Temperature float64 `json:"temperature"`
+	TotalBytes  int64   `json:"totalBytes"`
+	AccessScore float64 `json:"accessScore"`
+}
+
+// ToModel 转为领域模型。
+func (d DirectoryDTO) ToModel() model.Directory {
+	return model.Directory{
+		DirKey:      d.DirKey,
+		NodeID:      d.NodeID,
+		DiskSerial:  d.DiskSerial,
+		Tier:        model.Tier(d.Tier),
+		Temperature: d.Temperature,
+		TotalBytes:  d.TotalBytes,
+		AccessScore: d.AccessScore,
+	}
+}
+
+// DirectoryFromModel 领域模型转为传输结构。
+func DirectoryFromModel(d model.Directory) DirectoryDTO {
+	return DirectoryDTO{
+		DirKey:      d.DirKey,
+		NodeID:      d.NodeID,
+		DiskSerial:  d.DiskSerial,
+		Tier:        string(d.Tier),
+		Temperature: d.Temperature,
+		TotalBytes:  d.TotalBytes,
+		AccessScore: d.AccessScore,
+	}
+}
+
 // StateProvider 集群 API 的后端数据来源；实现可插拔（内存 / SQLite）。
 type StateProvider interface {
 	GetState() StatePayload
 	GetDiskLocation(diskSerial string) (string, bool) // 返回 mountedNodeID
 	RegisterReplica(assetID, diskSerial, checksum string) error
 	SubmitTask(task Task) error
+	GetDirectory(dirKey string) (model.Directory, bool, error) // 目录重宿主：读本地目录元数据
+	RelinquishDirectory(dirKey string) error                   // 目录重宿主：删除本地陈旧目录记录
 }
 
 // BlobSource 提供 blob 字节流的本地来源（执行迁移时其他节点按需拉取，§9.1）。
@@ -108,6 +149,8 @@ func (h *Handler) Mux() *http.ServeMux {
 	m.HandleFunc("/api/cluster/disk/", h.auth(h.handleDiskLocation))
 	m.HandleFunc("/api/cluster/replica/register", h.auth(h.handleRegisterReplica))
 	m.HandleFunc("/api/cluster/task", h.auth(h.handleSubmitTask))
+	m.HandleFunc("/api/cluster/directory/rehost", h.auth(h.handleRehostDirectory))
+	m.HandleFunc("/api/cluster/directory/", h.auth(h.handleGetDirectory))
 	m.HandleFunc("/api/cluster/blob/", h.auth(h.handleBlob))
 	return m
 }
@@ -208,6 +251,57 @@ func (h *Handler) handleSubmitTask(w http.ResponseWriter, r *http.Request) {
 	if err := h.Provider.SubmitTask(task); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
+	}
+	w.WriteHeader(http.StatusOK)
+}
+
+// handleGetDirectory 经 HMAC 鉴权 GET 拉取本节点某目录的元数据（§9.x 目录重宿主）；
+// 目标节点在本地无目录记录时从源节点拉取。404 表示本节点无此目录。
+func (h *Handler) handleGetDirectory(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	dirKey := lastPathSeg(r.URL.Path, "/api/cluster/directory/")
+	dir, ok, err := h.Provider.GetDirectory(dirKey)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if !ok {
+		w.WriteHeader(http.StatusNotFound)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "directory not found"})
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(DirectoryFromModel(dir))
+}
+
+// handleRehostDirectory 经 HMAC 鉴权 POST 处理目录重宿主的 relinquish 阶段（§9.x）：
+// 仅当本节点正是被要求放弃的源节点时才删除本地陈旧的目录聚合记录（数据已迁走），
+// 幂等且对称——同一请求发给两端，只有源节点会执行删除。
+func (h *Handler) handleRehostDirectory(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		DirKey         string `json:"dirKey"`
+		RelinquishNode string `json:"relinquishNode"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	if req.DirKey == "" || req.RelinquishNode == "" {
+		http.Error(w, "dirKey and relinquishNode required", http.StatusBadRequest)
+		return
+	}
+	if req.RelinquishNode == h.NodeID {
+		if err := h.Provider.RelinquishDirectory(req.DirKey); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
 	}
 	w.WriteHeader(http.StatusOK)
 }

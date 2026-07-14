@@ -30,6 +30,10 @@ func (f *fakeProvider) RegisterReplica(assetID, diskSerial, checksum string) err
 	return nil
 }
 func (f *fakeProvider) SubmitTask(task clusterapi.Task) error { return nil }
+func (f *fakeProvider) GetDirectory(string) (model.Directory, bool, error) {
+	return model.Directory{}, false, nil
+}
+func (f *fakeProvider) RelinquishDirectory(string) error { return nil }
 
 // fakeRepo 内存 coordinator.Repository，供 GlobalRepo 的本地部分与跨节点调度测试。
 type fakeRepo struct {

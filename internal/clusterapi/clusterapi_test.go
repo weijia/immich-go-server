@@ -12,11 +12,14 @@ import (
 	"testing"
 
 	"github.com/weijia/immich-go-server/internal/crypto"
+	"github.com/weijia/immich-go-server/internal/model"
 )
 
 type fakeProvider struct {
 	state    StatePayload
 	location map[string]string // diskSerial -> mountedNodeID
+	dirs     map[string]model.Directory
+	relin    []string
 	regs     []string
 	tasks    []Task
 }
@@ -32,6 +35,15 @@ func (f *fakeProvider) RegisterReplica(assetID, diskSerial, checksum string) err
 }
 func (f *fakeProvider) SubmitTask(t Task) error {
 	f.tasks = append(f.tasks, t)
+	return nil
+}
+func (f *fakeProvider) GetDirectory(dirKey string) (model.Directory, bool, error) {
+	d, ok := f.dirs[dirKey]
+	return d, ok, nil
+}
+func (f *fakeProvider) RelinquishDirectory(dirKey string) error {
+	delete(f.dirs, dirKey)
+	f.relin = append(f.relin, dirKey)
 	return nil
 }
 
@@ -168,6 +180,59 @@ func TestSubmitTask(t *testing.T) {
 	}
 	if len(p.tasks) != 1 || p.tasks[0].TaskID != "t1" {
 		t.Errorf("task not submitted: %v", p.tasks)
+	}
+}
+
+// TestGetDirectory 验证目录元数据 GET 端点：存在返回 200+序化 DTO，缺失返回 404。
+func TestGetDirectory(t *testing.T) {
+	p := &fakeProvider{dirs: map[string]model.Directory{
+		"d1": {DirKey: "d1", NodeID: "A", DiskSerial: "DA", Tier: model.TierWarm, TotalBytes: 7},
+	}}
+	h := newTestHandler(p)
+	resp := doSigned(t, h, http.MethodGet, "/api/cluster/directory/d1", nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", resp.StatusCode)
+	}
+	var dto DirectoryDTO
+	if err := json.NewDecoder(resp.Body).Decode(&dto); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if dto.DiskSerial != "DA" || dto.TotalBytes != 7 {
+		t.Errorf("unexpected dto: %+v", dto)
+	}
+
+	miss := doSigned(t, h, http.MethodGet, "/api/cluster/directory/nope", nil)
+	if miss.StatusCode != http.StatusNotFound {
+		t.Errorf("expected 404 for missing dir, got %d", miss.StatusCode)
+	}
+}
+
+// TestRehostDirectory 验证重宿主 relinquish 端点：仅当 relinquishNode==本节点才删除。
+func TestRehostDirectory(t *testing.T) {
+	p := &fakeProvider{dirs: map[string]model.Directory{"d1": {DirKey: "d1"}}, relin: nil}
+	h := newTestHandler(p) // 本节点 = testNode ("node-A")
+
+	// 非本节点：忽略删除
+	body, _ := json.Marshal(map[string]string{"dirKey": "d1", "relinquishNode": "node-Z"})
+	resp := doSigned(t, h, http.MethodPost, "/api/cluster/directory/rehost", body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", resp.StatusCode)
+	}
+	if len(p.relin) != 0 {
+		t.Errorf("non-self relinquish should be ignored, got %v", p.relin)
+	}
+
+	// 本节点：执行删除
+	body, _ = json.Marshal(map[string]string{"dirKey": "d1", "relinquishNode": testNode})
+	resp = doSigned(t, h, http.MethodPost, "/api/cluster/directory/rehost", body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", resp.StatusCode)
+	}
+	if len(p.relin) != 1 || p.relin[0] != "d1" {
+		t.Errorf("expected d1 relinquished, got %v", p.relin)
+	}
+	if _, ok := p.dirs["d1"]; ok {
+		t.Error("d1 should be deleted from provider")
 	}
 }
 

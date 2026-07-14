@@ -264,6 +264,70 @@ func (c *Client) SubmitTask(ctx context.Context, baseURL string, task clusterapi
 	return nil
 }
 
+// GetDirectory 经 HMAC 鉴权 GET 拉取对端某目录元数据（§9.x 目录跨节点重宿主）：
+// 目标节点在本地无目录记录时从源节点拉取权威视图。404 返回 ok=false。
+func (c *Client) GetDirectory(ctx context.Context, baseURL, dirKey string) (model.Directory, bool, error) {
+	path := "/api/cluster/directory/" + dirKey
+	now := c.Now()
+	hdr, err := clusterapi.SignHeaders(c.SelfNodeID, c.Secret, http.MethodGet, path, nil, now)
+	if err != nil {
+		return model.Directory{}, false, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, joinURL(baseURL, path), nil)
+	if err != nil {
+		return model.Directory{}, false, err
+	}
+	req.Header = hdr
+	resp, err := c.HTTPClient.Do(req)
+	if err != nil {
+		return model.Directory{}, false, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		return model.Directory{}, false, nil
+	}
+	if resp.StatusCode != http.StatusOK {
+		return model.Directory{}, false, fmt.Errorf("get directory: status %d", resp.StatusCode)
+	}
+	var dto clusterapi.DirectoryDTO
+	if err := json.NewDecoder(resp.Body).Decode(&dto); err != nil {
+		return model.Directory{}, false, err
+	}
+	return dto.ToModel(), true, nil
+}
+
+// RehostDirectory 经 HMAC 鉴权 POST 通知对端 relinquish 某目录记录（§9.x 目录跨节点重宿主）：
+// 源节点收到后会删除其本地陈旧的目录聚合视图（数据已迁走）。
+func (c *Client) RehostDirectory(ctx context.Context, baseURL, dirKey, relinquishNode string) error {
+	path := "/api/cluster/directory/rehost"
+	body, err := json.Marshal(struct {
+		DirKey         string `json:"dirKey"`
+		RelinquishNode string `json:"relinquishNode"`
+	}{DirKey: dirKey, RelinquishNode: relinquishNode})
+	if err != nil {
+		return err
+	}
+	now := c.Now()
+	hdr, err := clusterapi.SignHeaders(c.SelfNodeID, c.Secret, http.MethodPost, path, body, now)
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, joinURL(baseURL, path), bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header = hdr
+	resp, err := c.HTTPClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("rehost directory: status %d", resp.StatusCode)
+	}
+	return nil
+}
+
 // joinURL 拼接基址与路径，处理基址尾斜杠。
 func joinURL(base, path string) string {
 	u, err := url.Parse(base)
