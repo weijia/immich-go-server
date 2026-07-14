@@ -46,6 +46,17 @@ func VerifyRequest(secret, method, path string, ts int64, nonce, body []byte, si
 	return true
 }
 
+// SignPayload 计算集群状态 payload 签名（§9.5）：HMAC(clusterSecret, nodeId + ts + SHA256(jsonPayload))。
+// 用于 §9.1 状态拉取响应体自带的 signature 字段。
+func SignPayload(secret, nodeID string, ts int64, payload []byte) string {
+	h := sha256.Sum256(payload)
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write([]byte(nodeID))
+	mac.Write([]byte(strconv.FormatInt(ts, 10)))
+	mac.Write(h[:])
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
 // GenerateNonce 生成 16 字节随机 nonce。
 func GenerateNonce() ([]byte, error) {
 	b := make([]byte, 16)

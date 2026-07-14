@@ -5,6 +5,7 @@ import (
 
 	"github.com/weijia/immich-go-server/internal/balancer"
 	"github.com/weijia/immich-go-server/internal/config"
+	"github.com/weijia/immich-go-server/internal/migration"
 	"github.com/weijia/immich-go-server/internal/model"
 	"github.com/weijia/immich-go-server/internal/space"
 )
@@ -24,5 +25,17 @@ func main() {
 	}
 
 	fmt.Printf("tier for temp 0.3: %s\n", balancer.TargetTier(0.3, cfg))
+
+	// 演示迁移断点续传决策（§6.5.1）
+	src := []model.Asset{
+		{AssetID: "a1", Checksum: "c1"},
+		{AssetID: "a2", Checksum: "c2"},
+		{AssetID: "a3", Checksum: "c3"},
+	}
+	m := migration.Manifest{TaskID: "mig-1", Completed: []string{"a1"}, Partial: map[string]int64{"a3": 73}}
+	for _, act := range migration.ComputeResume(m, src) {
+		fmt.Printf("resume %s -> %d\n", act.AssetID, act.Mode)
+	}
+
 	fmt.Println("immich-go-server core booted")
 }
