@@ -153,3 +153,60 @@ func TestNodeDiscoverySelfSeen(t *testing.T) {
 	}
 	t.Fatalf("self beacon not seen in registry: %+v", n.Registry().Peers())
 }
+
+// TestNodeFederate 两个真实节点：A 把 B 的地址注入自身 registry 后 Federate，
+// 应得到含双方磁盘的全局视图，并选出协调者。
+func TestNodeFederate(t *testing.T) {
+	mk := func(id string) *Node {
+		dir := t.TempDir()
+		db := filepath.Join(dir, "s.db")
+		n, err := New(Config{NodeID: id, Secret: "sec", ListenAddr: "127.0.0.1:0", DBPath: db})
+		if err != nil {
+			t.Fatalf("New %s: %v", id, err)
+		}
+		return n
+	}
+	a := mk("A")
+	b := mk("B")
+	defer a.Close()
+	defer b.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = a.Run(ctx) }()
+	go func() { _ = b.Run(ctx) }()
+	addrA := waitAddr(t, a)
+	addrB := waitAddr(t, b)
+
+	// 各自存一块盘
+	if err := a.Store().SaveDisk(model.Disk{DiskSerial: "DA", Tier: model.TierHot, MountedNodeID: "A", OnlineSeconds: 300}); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Store().SaveDisk(model.Disk{DiskSerial: "DB", Tier: model.TierCold, MountedNodeID: "B", OnlineSeconds: 500}); err != nil {
+		t.Fatal(err)
+	}
+
+	// 把 B 的地址注入 A 的 registry（模拟发现结果）
+	a.Registry().Upsert("B", addrB, time.Now().Unix())
+
+	gv, err := a.Federate(ctx)
+	if err != nil {
+		t.Fatalf("Federate: %v", err)
+	}
+	if len(gv.Disks) != 2 {
+		t.Fatalf("expected 2 disks in global view, got %d: %v", len(gv.Disks), gv.Disks)
+	}
+	if _, ok := gv.Disks["DA"]; !ok {
+		t.Error("missing DA")
+	}
+	if _, ok := gv.Disks["DB"]; !ok {
+		t.Error("missing DB") // 来自远端 B，证明跨节点拉取成功
+	}
+	if gv.Coordinator != "B" {
+		t.Errorf("expected coordinator B (higher online seconds), got %s", gv.Coordinator)
+	}
+	if gv.SelfNodeID != "A" {
+		t.Errorf("self node id=%s", gv.SelfNodeID)
+	}
+	_ = addrA // A 自身地址在测试中未直接使用
+}

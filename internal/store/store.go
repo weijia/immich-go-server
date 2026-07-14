@@ -353,6 +353,7 @@ func (s *Store) GetState() clusterapi.StatePayload {
 			Tier:          string(d.Tier),
 			FreeBytes:     d.FreeBytes,
 			MountedNodeID: d.MountedNodeID,
+			OnlineSeconds: d.OnlineSeconds,
 		})
 	}
 	return clusterapi.StatePayload{NodeID: s.nodeID, Disks: out}

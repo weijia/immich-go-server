@@ -79,9 +79,20 @@ func makeTick(nodeID string, diskDirs []string, claimGrace int64) func(context.C
 				log.Printf("claim %s: %v", dir, err)
 			}
 		}
-		// 以本节点 Store 作为 Coordinator 的 Repository 跑一轮均衡
-		coord := coordinator.New(n.Store(), config.Default())
-		if emitted, err := coord.RunBalancingCycle(); err != nil {
+		// 跨节点聚合：拉取 peer 状态得到全局磁盘视图，再让 Coordinator 跨节点调度；
+		// 联邦失败（如全部 peer 不可达）则回退到本节点本地视图。
+		gv, err := n.Federate(ctx)
+		var repo coordinator.Repository = n.Store()
+		if err != nil {
+			log.Printf("federate: %v (fallback to local view)", err)
+		} else {
+			repo = n.GlobalRepository(gv)
+			if gv.Coordinator != nodeID {
+				log.Printf("coordinator is %s (self=%s)", gv.Coordinator, nodeID)
+			}
+		}
+		cond := coordinator.New(repo, config.Default())
+		if emitted, err := cond.RunBalancingCycle(); err != nil {
 			log.Printf("balancing cycle: %v", err)
 		} else if emitted > 0 {
 			log.Printf("balancing emitted %d tasks", emitted)

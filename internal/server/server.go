@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/weijia/immich-go-server/internal/cluster"
 	"github.com/weijia/immich-go-server/internal/clusterapi"
 	"github.com/weijia/immich-go-server/internal/discovery"
 	"github.com/weijia/immich-go-server/internal/store"
@@ -142,6 +143,32 @@ func (n *Node) Registry() *discovery.Registry { return n.reg }
 
 // API 暴露 ClusterApi Handler（供测试直接调用 Mux）。
 func (n *Node) API() *clusterapi.Handler { return n.api }
+
+// Federate 拉取各发现到的 peer 状态并聚合为全局视图（§9 / §10）。
+// 本节点状态直接取自 Store，不经过 HTTP。返回的 GlobalView 可用于 GlobalRepository。
+func (n *Node) Federate(ctx context.Context) (cluster.GlobalView, error) {
+	peers := n.reg.Peers()
+	cps := make([]cluster.Peer, 0, len(peers))
+	for _, p := range peers {
+		if p.NodeID == n.cfg.NodeID {
+			continue
+		}
+		cps = append(cps, cluster.Peer{NodeID: p.NodeID, URL: "http://" + p.Addr})
+	}
+	fed := &cluster.Federation{
+		SelfNodeID: n.cfg.NodeID,
+		SelfState:  n.store.GetState(),
+		Peers:      cps,
+		Client:     cluster.NewClient(n.cfg.NodeID, n.cfg.Secret, n.cfg.MaxSkew),
+	}
+	return fed.Run(ctx)
+}
+
+// GlobalRepository 基于全局视图构造 coordinator.Repository：磁盘来自跨节点合并，
+// 目录/资产/副本/任务下发仍走本节点 Store。
+func (n *Node) GlobalRepository(gv cluster.GlobalView) *cluster.GlobalRepo {
+	return &cluster.GlobalRepo{Disks: gv.Disks, Local: n.store}
+}
 
 // Close 释放资源（停止 Run 后调用）。
 func (n *Node) Close() error { return n.store.Close() }

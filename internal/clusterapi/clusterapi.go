@@ -15,9 +15,11 @@ import (
 )
 
 // StatePayload 对应 §9.1 集群状态拉取响应；Signature 由 SignPayload 计算（§9.5）。
+// SignedAt 为签名时刻的 epoch 秒，客户端据此重建签名并校验（§9.5 防篡改）。
 type StatePayload struct {
-	NodeID   string       `json:"nodeId"`
-	Disks    []DiskState  `json:"disks"`
+	NodeID    string      `json:"nodeId"`
+	Disks     []DiskState `json:"disks"`
+	SignedAt  int64       `json:"signedAt,omitempty"`
 	Signature string      `json:"signature,omitempty"`
 }
 
@@ -27,6 +29,7 @@ type DiskState struct {
 	Tier          string `json:"tier"`
 	FreeBytes     int64  `json:"freeBytes"`
 	MountedNodeID string `json:"mountedNodeId"`
+	OnlineSeconds int64  `json:"onlineSeconds,omitempty"`
 }
 
 // Task 集群任务（§9.2 / §16.1），由 Coordinator 下发。
@@ -144,10 +147,11 @@ func (h *Handler) handleState(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	p := h.Provider.GetState()
-	// 计算 payload 自带签名（§9.5）：对不含 signature 的 body 做 SignPayload
-	raw, _ := json.Marshal(p)
-	ts := h.Now()
-	p.Signature = crypto.SignPayload(h.Secret, p.NodeID, ts, raw)
+	// 计算 payload 自带签名（§9.5）：对不含 signature 的 body 做 SignPayload。
+	// SignedAt 一并写入 body，供客户端重建签名（§9.5 防篡改）。
+	p.SignedAt = h.Now()
+	raw, _ := json.Marshal(p) // 此时 Signature 为空（omitempty），raw 不含 signature
+	p.Signature = crypto.SignPayload(h.Secret, p.NodeID, p.SignedAt, raw)
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(p)
