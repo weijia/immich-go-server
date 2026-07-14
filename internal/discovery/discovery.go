@@ -116,6 +116,9 @@ func NewBroadcaster(conn PacketConn, secret, nodeID, addr string) *Broadcaster {
 	return &Broadcaster{conn: conn, secret: secret, nodeID: nodeID, addr: addr, now: func() int64 { return time.Now().Unix() }}
 }
 
+// SetAddr 设置 beacon 中广播的本节点可达地址（listen 之后才能确定）。
+func (b *Broadcaster) SetAddr(addr string) { b.addr = addr }
+
 // Build 构造一个已签名、带新鲜 nonce 的 beacon。
 func (b *Broadcaster) Build() (Beacon, error) {
 	nonce, err := crypto.GenerateNonce()

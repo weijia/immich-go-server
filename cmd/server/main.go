@@ -1,41 +1,163 @@
 package main
 
 import (
+	"context"
 	"fmt"
+	"log"
+	"os"
+	"os/signal"
+	"strings"
+	"syscall"
+	"time"
 
-	"github.com/weijia/immich-go-server/internal/balancer"
 	"github.com/weijia/immich-go-server/internal/config"
-	"github.com/weijia/immich-go-server/internal/migration"
+	"github.com/weijia/immich-go-server/internal/coordinator"
+	"github.com/weijia/immich-go-server/internal/diskid"
 	"github.com/weijia/immich-go-server/internal/model"
-	"github.com/weijia/immich-go-server/internal/space"
+	"github.com/weijia/immich-go-server/internal/server"
 )
 
 func main() {
-	cfg := config.Default()
+	nodeID := envOr("NODE_ID", "node-local")
+	secret := envOr("CLUSTER_SECRET", "dev-secret")
+	listen := envOr("LISTEN", "127.0.0.1:8080")
+	dbPath := envOr("DB_PATH", "immich-go.db")
+	blobRoot := envOr("BLOB_ROOT", "./blobs")
+	discover := envOr("DISCOVER_ADDR", "") // 例：239.0.0.1:9999
+	diskDirs := splitList(envOr("DISK_DIRS", ""))
+	claimGrace := int64(envOrInt("CLAIM_GRACE_SEC", 3600))
 
-	disks := []model.Disk{
-		{DiskSerial: "SSD-A", CapacityBytes: 100 << 30, FreeBytes: 60 << 30, Tier: model.TierHot, OnlineSeconds: 900000},
-		{DiskSerial: "HDD-B", CapacityBytes: 1000 << 30, FreeBytes: 900 << 30, Tier: model.TierCold, OnlineSeconds: 100000},
+	base := server.Config{
+		NodeID:   nodeID,
+		Secret:   secret,
+		ListenAddr: listen,
+		BlobRoot:  blobRoot,
+		DBPath:    dbPath,
+		DiscoverAddr: discover,
+	}
+	if len(diskDirs) > 0 {
+		base.OnTick = makeTick(nodeID, diskDirs, claimGrace)
 	}
 
-	if d, ok := space.SelectWriteDisk(disks, 10<<20, cfg); ok {
-		fmt.Printf("write target: %s\n", d.DiskSerial)
-	} else {
-		fmt.Println("507 Storage Full")
+	node, err := server.New(base)
+	if err != nil {
+		log.Fatalf("init node: %v", err)
 	}
+	defer node.Close()
 
-	fmt.Printf("tier for temp 0.3: %s\n", balancer.TargetTier(0.3, cfg))
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
 
-	// 演示迁移断点续传决策（§6.5.1）
-	src := []model.Asset{
-		{AssetID: "a1", Checksum: "c1"},
-		{AssetID: "a2", Checksum: "c2"},
-		{AssetID: "a3", Checksum: "c3"},
+	go func() {
+		if err := node.Run(ctx); err != nil {
+			log.Printf("node stopped: %v", err)
+		}
+	}()
+
+	addr := node.Addr()
+	if addr == "" {
+		// Run 已异步启动，稍等监听就绪
+		for i := 0; i < 100; i++ {
+			if a := node.Addr(); a != "" {
+				addr = a
+				break
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
 	}
-	m := migration.Manifest{TaskID: "mig-1", Completed: []string{"a1"}, Partial: map[string]int64{"a3": 73}}
-	for _, act := range migration.ComputeResume(m, src) {
-		fmt.Printf("resume %s -> %d\n", act.AssetID, act.Mode)
-	}
+	log.Printf("immich-go-server node %q listening on %s (discovery=%q)", nodeID, addr, discover)
+	<-ctx.Done()
+	log.Println("shutting down")
+}
 
-	fmt.Println("immich-go-server core booted")
+// makeTick 返回每轮 Tick 执行的逻辑：认领本地磁盘 + 运行一次调度均衡。
+func makeTick(nodeID string, diskDirs []string, claimGrace int64) func(context.Context, *server.Node) {
+	return func(ctx context.Context, n *server.Node) {
+		now := time.Now().Unix()
+		for _, dir := range diskDirs {
+			if err := claimDisk(n, dir, nodeID, now, claimGrace); err != nil {
+				log.Printf("claim %s: %v", dir, err)
+			}
+		}
+		// 以本节点 Store 作为 Coordinator 的 Repository 跑一轮均衡
+		coord := coordinator.New(n.Store(), config.Default())
+		if emitted, err := coord.RunBalancingCycle(); err != nil {
+			log.Printf("balancing cycle: %v", err)
+		} else if emitted > 0 {
+			log.Printf("balancing emitted %d tasks", emitted)
+		}
+	}
+}
+
+// claimDisk 对每个本地磁盘目录：生成/读取 disk-id、落盘统计、
+// 并在 store 中认领（或续占）该盘（§11.2 / §11.3 / §11.4）。
+func claimDisk(n *server.Node, dir, nodeID string, now, grace int64) error {
+	idFile, err := diskid.ReadOrCreateDiskID(dir, nodeID)
+	if err != nil {
+		return fmt.Errorf("disk-id: %w", err)
+	}
+	stats, ok, err := diskid.ReadDiskStats(dir)
+	if err != nil {
+		return fmt.Errorf("disk-stats: %w", err)
+	}
+	if !ok {
+		stats = diskid.DiskStatsFile{DiskID: idFile.DiskID, FirstSeenAt: now, LastTickAt: now}
+	}
+	disk := model.Disk{
+		DiskSerial: idFile.DiskID,
+		Label:      idFile.Label,
+		Tier:       model.TierHot, // 真实环境按 SMART/容量判定；此处默认
+		FirstSeenAt: stats.FirstSeenAt,
+		LastSeenAt: now,
+	}
+	if err := n.Store().SaveDisk(disk); err != nil {
+		return fmt.Errorf("save disk: %w", err)
+	}
+	claimed, err := n.Store().ClaimOrTouchDisk(idFile.DiskID, nodeID, now, grace)
+	if err != nil {
+		return fmt.Errorf("claim: %w", err)
+	}
+	stats.OnlineSeconds = claimed.OnlineSeconds
+	stats.LastTickAt = now
+	stats.UpdatedAt = now
+	if err := diskid.WriteDiskStats(dir, stats); err != nil {
+		return fmt.Errorf("write stats: %w", err)
+	}
+	return nil
+}
+
+func envOr(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
+}
+
+func envOrInt(key string, def int) int {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	n := 0
+	for _, c := range v {
+		if c < '0' || c > '9' {
+			return def
+		}
+		n = n*10 + int(c-'0')
+	}
+	return n
+}
+
+func splitList(s string) []string {
+	if strings.TrimSpace(s) == "" {
+		return nil
+	}
+	parts := strings.Split(s, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
