@@ -894,15 +894,47 @@ sig = HMAC-SHA256(clusterSecret, canonical)
 
 ## 12. 端到端流程示例
 
-### 12.1 新文件上传
+### 12.1 新文件上传（含 507 退回重试）
 
 ```
-1. 客户端上传到就近在线节点 N（复用现有 POST /api/assets）
-2. N 按 §5.4(b) 写时磁盘分配选盘，保存主副本到本机热/温/冷层磁盘，写 replica(status=PENDING)
-3. Coordinator 在下次状态拉取中发现该 asset 副本数=1 < 2
-4. Coordinator 下发补副本任务 → 选一块反亲和磁盘（优先冷层做归档副本）
-5. 复制 + 校验 + register，副本数=2 → status=HEALTHY
+客户端                节点 N                 Coordinator            目标节点 T
+  │  POST /api/assets  │                                            │
+  │───────────────────>│                                            │
+  │                    │ ① 按 §5.4(b) 选盘：本机在线盘、写入后空闲   │
+  │                    │     ≥ 硬底线(§5.5) 且 ≥ 层软目标           │
+  │                    │   ├─ 命中 → 落盘主副本                      │
+  │                    │   └─ 未命中(全满) → 返回 507 Storage Full   │
+  │  507 ◀────────────│                                            │
+  │                    │                                            │
+  │ ② 选盘成功 → 写盘；成功即按 §5.4(a) 刷 free_bytes（写后校正）   │
+  │ ③ 写 replica(status=PENDING)；返回 201 + assetId 给客户端       │
+  │<──────────────────│                                            │
+  │   201 OK           │                                            │
+  │                    │ ④ 状态上报(或拉取)携带该新 asset           │
+  │                    │─────────────────── GET /api/cluster/state ─>│
+  │                    │                                            │ ⑤ 发现副本数=1 < MIN_REPLICAS
+  │                    │                                            │    选反亲和目标盘(优先冷层,§7.2)
+  │                    │ <── POST /api/cluster/task (补副本) ────────│
+  │                    │────────── GET /api/cluster/blob/:assetId ──│──>│
+  │                    │<──────── 流式字节 + checksum ──────────────│<──│
+  │                    │ ⑥ 逐文件校验 → POST /replica/register      │
+  │                    │────────────────── POST /replica/register ─>│
+  │                    │                                            │ ⑦ 副本数=2 → status=HEALTHY
 ```
+
+**507 退回与重试逻辑（节点 N 全盘写不下时）**：
+
+```
+1. N 选盘失败（本机所有在线盘写入后都会跌破硬底线 §5.5，或写入后空闲 < 层软目标）
+   → 返回 507 Storage Full，body 附 { "reason": "no_disk_space", "nodeId": N }
+2. 客户端从发现列表(§9.3)另选一个在线节点 M 重发上传；若 M 也 507，继续遍历其他在线节点
+3. 若所有已知在线节点均 507：
+   - 客户端本地暂存/排队，并周期重试（退避）
+   - 同时：任一节点因 "全部盘逼近硬底线" 触发 §5.4(c) 反应式紧急下沉，腾出空间后重试多能成功
+4. 重试为幂等：以 asset 内容哈希(clientHash) 去重，避免重复落盘产生孤儿文件
+```
+
+> 关键点：507 是**节点级**回退，不丢上传请求；配合反应式下沉(§5.4(c))形成"满了→腾挪→再写"的闭环。
 
 ### 12.2 上个月目录下沉（R1）
 
@@ -927,15 +959,33 @@ sig = HMAC-SHA256(clusterSecret, canonical)
 
 ## 13. 边界情况与冲突处理
 
+### 13.1 场景处理表
+
 | 场景 | 处理 |
 |------|------|
 | 唯一持有副本的磁盘离线，且无法补副本 | 标记 `AT_RISK`，告警用户；恢复在线后优先补副本 |
-| 迁移中途源或目标掉线 | 任务超时回滚，源副本保留，下周期重试 |
-| 两节点同时认为自己是 Coordinator（脑裂） | 以 `onlineScore` 高者为准，低者退让；操作幂等避免重复迁移 |
-| 磁盘拔到新节点 | 新节点扫描 `.immich-disk-id` / 序列号，认领已有副本，更新 `mounted_node_id` |
+| 迁移中途源或目标掉线 | 任务超时回滚（§6.5.2）：源副本保留、清理目标残留；下周期按 `.migrating.json` 续传 |
+| 两节点同时认为自己是 Coordinator（脑裂） | 以 `onlineScore` 高者为准，低者退让（§10.4）；操作带 `coordinatorEpoch`+幂等 `taskId` 去重，避免重复迁移 |
+| 磁盘拔到新节点 | 新节点扫描 `.immich-disk-id` / 序列号，认领已有副本，更新 `mounted_node_id`（§11.3） |
 | 同一 asset 元数据冲突 | 以 `updated_at` 较新者为准（LWW），副本集合取并集后按健康检查收敛 |
-| 用户删除 asset | 软删除→回收站→过期后删除所有副本 |
-| 全集群仅 1 个节点/1 块磁盘 | 无法满足 R3，降级为单副本并告警；接入第二块磁盘后自动补副本 |
+| 用户删除 asset | 软删除→回收站→过期后删除所有副本（幂等，崩溃可重跑） |
+| 全集群仅 1 个节点/1 块磁盘 | 无法满足 R3，降级为单副本并告警（§10.5）；接入第二块磁盘后自动补副本 |
+| 补副本目标盘在复制中途掉线 | 目标 partial 清理、该 asset 重新标记 `UNDER_REPLICATED`，下次选其它盘重试（§7.2） |
+| Coordinator 在迁移进行中崩溃 | 目标 `.migrating.json` 续传、源保留；新 Coordinator 重发同 `taskId` 仅续传不重复全量（§6.5.1） |
+| 两块盘同时离线且互为某 asset 仅有的两份副本 | 仍触发 `AT_RISK` + 预防性补副本（若有第三盘可落）；否则按单副本告警，恢复任一盘即收敛 |
+| 磁盘写满到硬底线边界、新上传 507 | 反应式紧急下沉（§5.4(c)）腾空间，客户端按 §12.1 重试；不写越线 |
+| 同一目录被两个 Coordinator epoch 同时迁移（脑裂期） | `coordinatorEpoch` 高者胜，低者任务作废；`taskId` 去重保证目录只被迁一次（§10.4） |
+| 副本过度复制（>MIN_REPLICAS） | 健康检查（§7.2）回收多余份（优先删最冷层/最不可靠盘上的副本），收敛回目标数 |
+| 节点时钟偏移致 HMAC 被拒 | `MAX_CLOCK_SKEW`（§9.5）内可恢复；长期偏移节点告警并要求校正时钟后重新握手领密钥 |
+| 认领期间双节点短暂同时可见同一磁盘 | 先完成认领并上报者归属，另一方收到聚合视图后自动退让该盘归属声明（§11.3） |
+| 网络分区导致 Coordinator 视野分裂 | 进入降级（§10.5）：各节点保本机副本、暂停全局均衡；分区恢复后合并视图、按 `taskId` 去重补跑 |
+
+### 13.2 冲突处理原则小结
+
+- **数据不丢优先于决策进度**：任何回滚/崩溃都保留源，副本数门槛（≥2）是删源唯一通行证。
+- **幂等去重**：所有写操作以 `assetId`/`taskId`/`coordinatorEpoch` 去重，重复下发不产生孤儿或重复迁移。
+- **最终一致可接受**：短时间副本数不足、视图分裂均允许，靠周期健康检查与重跑收敛，不强求强一致。
+- **自动收敛**：过度复制、元数据冲突、归属争夺，最终都由健康检查/LWW/退让规则自动归位，无需人工介入。
 
 ---
 
@@ -1004,6 +1054,59 @@ sig = HMAC-SHA256(clusterSecret, canonical)
 | `AssetRoutes` | 记录访问事件；上传后触发补副本 |
 | `SyncRoutes`（当前 stub） | 可演进为集群元数据同步通道 |
 | `BatteryMonitor` / `StorageMonitor` | 为迁移节流与空闲水位提供输入 |
+
+### 16.1 建议接口签名（Go，immich-go-server）
+
+> 以下为衔接点的函数级签名草案，便于实现阶段直接落地；错误返回省略 `error` 以聚焦语义。
+
+**集群 API 层（§9）**
+
+```go
+// 状态拉取与发现
+func (s *ClusterApi) GetState(w, r) StatePayload          // GET /api/cluster/state (§9.1)
+func (s *ClusterApi) GetDiskLocation(diskSerial string) DiskLocation // GET /api/cluster/disk/:diskSerial/location (§9.4)
+func (s *ClusterApi) GetBlob(w, r, assetId string)        // GET /api/cluster/blob/:assetId，支持 Range (§9.2/§6.5.1)
+func (s *ClusterApi) RegisterReplica(assetId, diskSerial, checksum string) // POST /api/cluster/replica/register
+func (s *ClusterApi) VerifyReplica(assetId, diskSerial string) bool        // POST /api/cluster/replica/verify
+func (s *ClusterApi) DeleteReplica(replicaId string)                       // DELETE /api/cluster/replica/:id
+func (s *ClusterApi) SubmitTask(task MigrationTask | ReplicaTask)          // POST /api/cluster/task (§9.2)
+
+// 鉴权（§9.5）
+func SignRequest(secret, method, path string, ts int64, nonce, body []byte) string // HMAC-SHA256
+func VerifyRequest(secret string, headers XClusterHeaders, body []byte) bool       // 四道关
+```
+
+**节点本地能力（§4/§5/§11）**
+
+```go
+func (n *Node) SelectWriteDisk(size int64) (Disk, error)   // §5.4(b) 写时分配，全满返 ErrStorageFull(507)
+func (n *Node) ClaimDisk(rootPath string) error            // §11.3 认领：读 disk-id/stats、扫 .immich-dir.json、建表
+func (n *Node) FlushDiskStats(disk Disk)                   // §11.4 按 STATS_FLUSH_INTERVAL 落盘统计
+func (n *Node) RefreshFreeBytes(disk Disk)                 // §5.4(a) 写/删后 statfs 校正 free_bytes
+```
+
+**Coordinator 决策（§6/§7/§10）**
+
+```go
+type Coordinator struct{ epoch int64 }
+
+func (c *Coordinator) RunBalancingCycle()                  // 月度评估 + 反应式水位(§5.4(c)/§6.4)
+func (c *Coordinator) AggregateDiskStats(reports []NodeReport) map[string]DiskStats // §4.3 只读聚合
+func (c *Coordinator) PlanMigration(dir Directory) (MigrationPlan, error) // §6.4 含收益评分+目标盘
+func (c *Coordinator) SelectReplicaTarget(asset Asset) (Disk, error)     // §7.2 反亲和+层分布打分
+func (c *Coordinator) CheckReplicas() []ReplicaTask                       // §7.2 健康检查→补副本任务
+func (c *Coordinator) Elect()                                            // §10 选举/漂移/退让
+```
+
+**磁盘自描述文件（§11.2/§11.4）**
+
+```go
+type DiskIdFile   struct { DiskId, GeneratedAt, HostNodeId, Label string }
+type DiskStatsFile struct { DiskId string; OnlineSeconds, FirstSeenAt, LastTickAt, UpdatedAt int64 }
+type DirManifest  struct { DirKey string; Files []FileEntry; Checksum string } // .immich-dir.json (§11)
+```
+
+> 与 `HmacUtils`/`serverToken` 衔接：集群鉴权改用 `clusterSecret`（§9.5），`serverToken` 仍用于单节点既有接口，两者并存不冲突。
 
 ---
 
