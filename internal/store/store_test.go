@@ -56,6 +56,56 @@ func TestDiskUpsertAndUpdateFree(t *testing.T) {
 	}
 }
 
+func TestClaimOrTouchDisk(t *testing.T) {
+	s := newTestStore(t)
+	// 起始：无主、在线时长为 0
+	if err := s.SaveDisk(model.Disk{DiskSerial: "D1", Tier: model.TierHot, LastSeenAt: 1000}); err != nil {
+		t.Fatal(err)
+	}
+	grace := int64(3600)
+
+	// 节点 A 认领：应成功，挂载到 A，在线时长从 now-lastSeen 累加 (5000-1000=4000)
+	d, err := s.ClaimOrTouchDisk("D1", "node-A", 5000, grace)
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	if d.MountedNodeID != "node-A" {
+		t.Errorf("expected mounted by node-A, got %s", d.MountedNodeID)
+	}
+	if d.OnlineSeconds != 4000 {
+		t.Errorf("expected online 4000, got %d", d.OnlineSeconds)
+	}
+
+	// 续占：再次 touch，now=5600 → 累加 600 → 4600
+	d2, err := s.ClaimOrTouchDisk("D1", "node-A", 5600, grace)
+	if err != nil {
+		t.Fatalf("touch: %v", err)
+	}
+	if d2.OnlineSeconds != 4600 {
+		t.Errorf("expected online 4600, got %d", d2.OnlineSeconds)
+	}
+
+	// 另一在线节点 B（lastSeen 很新）尝试认领 → 应失败
+	if err := s.SaveDisk(model.Disk{DiskSerial: "D2", Tier: model.TierHot, MountedNodeID: "node-B", LastSeenAt: 5600}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.ClaimOrTouchDisk("D2", "node-A", 5700, grace); err == nil {
+		t.Error("claim by other online node should fail")
+	}
+
+	// 节点 B 已离线超 grace：A 可重新认领（§11.3 重新认领）
+	if err := s.SaveDisk(model.Disk{DiskSerial: "D3", Tier: model.TierHot, MountedNodeID: "node-B", LastSeenAt: 1000}); err != nil {
+		t.Fatal(err)
+	}
+	reclaimed, err := s.ClaimOrTouchDisk("D3", "node-A", 6000, grace)
+	if err != nil {
+		t.Fatalf("reclaim offline disk: %v", err)
+	}
+	if reclaimed.MountedNodeID != "node-A" {
+		t.Errorf("expected reclaimed by node-A, got %s", reclaimed.MountedNodeID)
+	}
+}
+
 func TestListDisks(t *testing.T) {
 	s := newTestStore(t)
 	_ = s.SaveDisk(model.Disk{DiskSerial: "A", Tier: model.TierHot})

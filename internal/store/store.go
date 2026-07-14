@@ -7,6 +7,7 @@ import (
 
 	_ "modernc.org/sqlite"
 
+	"github.com/weijia/immich-go-server/internal/claim"
 	"github.com/weijia/immich-go-server/internal/clusterapi"
 	"github.com/weijia/immich-go-server/internal/model"
 )
@@ -141,6 +142,31 @@ func (s *Store) ListDisks() ([]model.Disk, error) {
 func (s *Store) UpdateFree(serial string, freeBytes int64) error {
 	_, err := s.db.Exec(`UPDATE disk SET free_bytes=? WHERE disk_serial=?`, freeBytes, serial)
 	return err
+}
+
+// ClaimOrTouchDisk 认领（或续占）磁盘（§11.3）：若当前无主或原主已离线超 grace，则挂载到本节点；
+// 同时按 now-lastSeenAt 累加在线秒数并更新 lastSeenAt。返回最终磁盘状态或错误。
+func (s *Store) ClaimOrTouchDisk(serial, nodeID string, now, graceOffline int64) (model.Disk, error) {
+	d, ok, err := s.GetDisk(serial)
+	if err != nil {
+		return model.Disk{}, err
+	}
+	if !ok {
+		return model.Disk{}, fmt.Errorf("disk not found: %s", serial)
+	}
+	if d.MountedNodeID == "" || d.MountedNodeID == nodeID {
+		d.MountedNodeID = nodeID
+	} else if claim.EligibleForClaim(d, nodeID, now, graceOffline) {
+		d.MountedNodeID = nodeID // 重新认领离线磁盘
+	} else {
+		return d, fmt.Errorf("disk %s owned by online node %s", serial, d.MountedNodeID)
+	}
+	d.OnlineSeconds = claim.AccrueOnlineSeconds(d.OnlineSeconds, d.LastSeenAt, now)
+	d.LastSeenAt = now
+	if err := s.SaveDisk(d); err != nil {
+		return model.Disk{}, err
+	}
+	return d, nil
 }
 
 func scanDisk(rows *sql.Rows) (model.Disk, error) {
