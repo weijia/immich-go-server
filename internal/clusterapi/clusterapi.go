@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"strconv"
@@ -46,6 +47,15 @@ type StateProvider interface {
 	SubmitTask(task Task) error
 }
 
+// BlobSource 提供 blob 字节流的本地来源（执行迁移时其他节点按需拉取，§9.1）。
+// 仅持有数据的节点需要设置；无数据的节点可将 Handler.Source 置 nil。
+type BlobSource interface {
+	// StatBlob 返回 blob 总字节数与校验和（如无可填空串），不存在时 ok=false。
+	StatBlob(assetID string) (size int64, checksum string, ok bool)
+	// OpenBlob 从 offset 起返回只读字节流（用于 Range 续传）。
+	OpenBlob(assetID string, offset int64) (io.ReadCloser, error)
+}
+
 // Handler 持有节点身份、共享密钥与后端 provider，注册带 HMAC 鉴权的路由。
 type Handler struct {
 	NodeID   string
@@ -53,6 +63,7 @@ type Handler struct {
 	MaxSkew  int64
 	Now      func() int64
 	Provider StateProvider
+	Source   BlobSource // 可选：提供 blob 拉取（§9.1）
 
 	mu   sync.Mutex
 	seen map[string]bool
@@ -93,6 +104,7 @@ func (h *Handler) Mux() *http.ServeMux {
 	m.HandleFunc("/api/cluster/disk/", h.auth(h.handleDiskLocation))
 	m.HandleFunc("/api/cluster/replica/register", h.auth(h.handleRegisterReplica))
 	m.HandleFunc("/api/cluster/task", h.auth(h.handleSubmitTask))
+	m.HandleFunc("/api/cluster/blob/", h.auth(h.handleBlob))
 	return m
 }
 
@@ -193,6 +205,107 @@ func (h *Handler) handleSubmitTask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusOK)
+}
+
+// handleBlob 提供 blob 字节流拉取（§9.1），支持 Range 续传（206）。
+func (h *Handler) handleBlob(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if h.Source == nil {
+		http.Error(w, "blob source not configured", http.StatusNotImplemented)
+		return
+	}
+	assetID := lastPathSeg(r.URL.Path, "/api/cluster/blob/")
+	size, checksum, ok := h.Source.StatBlob(assetID)
+	if !ok {
+		http.Error(w, "blob not found", http.StatusNotFound)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Accept-Ranges", "bytes")
+	if checksum != "" {
+		w.Header().Set("X-Blob-Checksum", checksum)
+	}
+
+	rng := r.Header.Get("Range")
+	if rng == "" {
+		rc, err := h.Source.OpenBlob(assetID, 0)
+		if err != nil {
+			http.Error(w, "open failed", http.StatusInternalServerError)
+			return
+		}
+		defer rc.Close()
+		w.Header().Set("Content-Length", strconv.FormatInt(size, 10))
+		io.Copy(w, rc)
+		return
+	}
+
+	start, end, ok := parseByteRange(rng, size)
+	if !ok {
+		w.Header().Set("Content-Range", "bytes */"+strconv.FormatInt(size, 10))
+		http.Error(w, "range not satisfiable", http.StatusRequestedRangeNotSatisfiable)
+		return
+	}
+	rc, err := h.Source.OpenBlob(assetID, start)
+	if err != nil {
+		http.Error(w, "open failed", http.StatusInternalServerError)
+		return
+	}
+	defer rc.Close()
+	w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, size))
+	w.Header().Set("Content-Length", strconv.FormatInt(end-start+1, 10))
+	w.WriteHeader(http.StatusPartialContent)
+	_, _ = io.CopyN(w, rc, end-start+1)
+}
+
+// parseByteRange 解析单个 "bytes=start-end" / "bytes=start-" / "bytes=-suffix" 范围（§9.1）。
+// 返回 [start, end] 闭区间；越界或非法返回 ok=false。
+func parseByteRange(header string, size int64) (start, end int64, ok bool) {
+	const pfx = "bytes="
+	if len(header) <= len(pfx) || header[:len(pfx)] != pfx {
+		return 0, 0, false
+	}
+	spec := header[len(pfx):]
+	dashIdx := -1
+	for i := 0; i < len(spec); i++ {
+		if spec[i] == '-' {
+			dashIdx = i
+			break
+		}
+	}
+	if dashIdx < 0 {
+		return 0, 0, false
+	}
+	left := spec[:dashIdx]
+	right := spec[dashIdx+1:]
+
+	if left == "" && right == "" {
+		return 0, 0, false
+	}
+	if left == "" {
+		// 后缀形式 bytes=-N
+		n, err := strconv.ParseInt(right, 10, 64)
+		if err != nil || n <= 0 || n > size {
+			return 0, 0, false
+		}
+		return size - n, size - 1, true
+	}
+	s, err := strconv.ParseInt(left, 10, 64)
+	if err != nil || s < 0 || s >= size {
+		return 0, 0, false
+	}
+	start = s
+	if right == "" {
+		return start, size - 1, true
+	}
+	e, err := strconv.ParseInt(right, 10, 64)
+	if err != nil || e < start || e >= size {
+		return 0, 0, false
+	}
+	return start, e, true
 }
 
 // timeNow 返回当前 epoch 秒（可被测试通过 Handler.Now 覆盖）。

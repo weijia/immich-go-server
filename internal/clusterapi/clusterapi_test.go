@@ -2,7 +2,10 @@ package clusterapi
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -197,4 +200,139 @@ func payloadSigOf(t *testing.T, raw []byte) string {
 	_ = json.Unmarshal(raw, &m)
 	s, _ := m["signature"].(string)
 	return s
+}
+
+// ---- blob 拉取端点（§9.1）---- 
+
+// memBlob 内存实现 BlobSource，供测试。
+type memBlob struct {
+	data map[string][]byte
+}
+
+func (m *memBlob) StatBlob(id string) (int64, string, bool) {
+	b, ok := m.data[id]
+	if !ok {
+		return 0, "", false
+	}
+	return int64(len(b)), fmt.Sprintf("%x", sha256.Sum256(b)), true
+}
+
+func (m *memBlob) OpenBlob(id string, off int64) (io.ReadCloser, error) {
+	b, ok := m.data[id]
+	if !ok {
+		return nil, fmt.Errorf("not found")
+	}
+	if off > int64(len(b)) {
+		return nil, io.EOF
+	}
+	return io.NopCloser(bytes.NewReader(b[off:])), nil
+}
+
+func newTestHandlerWithBlob(p StateProvider, b BlobSource) *Handler {
+	h := newTestHandler(p)
+	h.Source = b
+	return h
+}
+
+func TestBlobFull(t *testing.T) {
+	p := &fakeProvider{}
+	b := &memBlob{data: map[string][]byte{"a1": []byte("hello-cluster-blob")}}
+	h := newTestHandlerWithBlob(p, b)
+	resp := doSigned(t, h, http.MethodGet, "/api/cluster/blob/a1", nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", resp.StatusCode)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if string(body) != "hello-cluster-blob" {
+		t.Errorf("unexpected body %q", string(body))
+	}
+	if resp.Header.Get("Accept-Ranges") != "bytes" {
+		t.Error("missing Accept-Ranges")
+	}
+	wantCS := sha256.Sum256([]byte("hello-cluster-blob"))
+	if got := resp.Header.Get("X-Blob-Checksum"); got != hex.EncodeToString(wantCS[:]) {
+		t.Errorf("checksum header mismatch: got %s", got)
+	}
+}
+
+func TestBlobRange(t *testing.T) {
+	b := &memBlob{data: map[string][]byte{"a1": []byte("0123456789")}}
+	h := newTestHandlerWithBlob(&fakeProvider{}, b)
+
+	cases := []struct {
+		rng      string
+		wantCode int
+		wantLen  int
+		wantBody string
+	}{
+		{"bytes=0-4", http.StatusPartialContent, 5, "01234"},
+		{"bytes=5-9", http.StatusPartialContent, 5, "56789"},
+		{"bytes=2-", http.StatusPartialContent, 8, "23456789"},
+		{"bytes=-3", http.StatusPartialContent, 3, "789"},
+		{"bytes=0-99", http.StatusRequestedRangeNotSatisfiable, 0, ""},
+	}
+	for _, c := range cases {
+		hdr, _ := SignHeaders(testNode, testSecret, http.MethodGet, "/api/cluster/blob/a1", nil, fixedNow)
+		req := httptest.NewRequest(http.MethodGet, "/api/cluster/blob/a1", nil)
+		req.Header = hdr
+		req.Header.Set("Range", c.rng)
+		rec := httptest.NewRecorder()
+		h.Mux().ServeHTTP(rec, req)
+		if rec.Code != c.wantCode {
+			t.Errorf("%s: code=%d want %d", c.rng, rec.Code, c.wantCode)
+			continue
+		}
+		if c.wantCode == http.StatusPartialContent {
+			if rec.Body.String() != c.wantBody {
+				t.Errorf("%s: body=%q want %q", c.rng, rec.Body.String(), c.wantBody)
+			}
+			if rec.Header().Get("Content-Length") != fmt.Sprintf("%d", c.wantLen) {
+				t.Errorf("%s: content-length=%s want %d", c.rng, rec.Header().Get("Content-Length"), c.wantLen)
+			}
+		}
+	}
+}
+
+func TestBlobNotFound(t *testing.T) {
+	h := newTestHandlerWithBlob(&fakeProvider{}, &memBlob{data: map[string][]byte{}})
+	resp := doSigned(t, h, http.MethodGet, "/api/cluster/blob/missing", nil)
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d", resp.StatusCode)
+	}
+}
+
+func TestBlobNoSource(t *testing.T) {
+	// 未配置 Source 的节点应返回 501
+	h := newTestHandler(&fakeProvider{})
+	resp := doSigned(t, h, http.MethodGet, "/api/cluster/blob/a1", nil)
+	if resp.StatusCode != http.StatusNotImplemented {
+		t.Fatalf("expected 501, got %d", resp.StatusCode)
+	}
+}
+
+func TestParseByteRange(t *testing.T) {
+	cases := []struct {
+		rng     string
+		size    int64
+		ok      bool
+		start   int64
+		end     int64
+	}{
+		{"bytes=0-4", 10, true, 0, 4},
+		{"bytes=5-9", 10, true, 5, 9},
+		{"bytes=2-", 10, true, 2, 9},
+		{"bytes=-3", 10, true, 7, 9},
+		{"bytes=0-99", 10, false, 0, 0},
+		{"bytes=10-11", 10, false, 0, 0}, // start >= size
+		{"bytes=5-4", 10, false, 0, 0},   // end < start
+		{"items=0-1", 10, false, 0, 0},   // bad prefix
+		{"bytes=-", 10, false, 0, 0},     // empty
+		{"bytes", 10, false, 0, 0},
+	}
+	for _, c := range cases {
+		s, e, ok := parseByteRange(c.rng, c.size)
+		if ok != c.ok || s != c.start || e != c.end {
+			t.Errorf("parseByteRange(%q,%d)=%v,%v,%v want %v,%v,%v", c.rng, c.size, s, e, ok, c.start, c.end, c.ok)
+		}
+	}
 }
