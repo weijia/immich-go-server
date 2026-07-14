@@ -112,7 +112,7 @@
 - **挂载 / 启动**：服务器程序检测到磁盘可读写，开始计时。
 - **运行中**：持续累加该磁盘的在线秒数（存于本机 `disk` 表）。
 - **卸载 / 关机 / 休眠**：停止计时并结算当前累计值。
-- **重新挂载（含迁移到新节点）**：从磁盘上已持久化的累计值继续累加，**不归零**。
+- **重新挂载（含迁移到新节点）**：从磁盘上的 `.immich-disk-stats` 持久化值继续累加，**不归零**（文件格式见 §11.4）。
 
 ```
 // 本机服务器程序只对「本机挂载的磁盘」自行累加
@@ -137,7 +137,7 @@ if 磁盘当前可读写:
 - 在线时长由**本机自治维护**，不做节点间互相更新。
 - 负载均衡决策时，每个节点**上报本机所有磁盘**的当前统计：`{diskSerial, onlineSeconds, firstSeenAt, capacityBytes, freeBytes, mountedNodeId}`（其中 `onlineSeconds` 为本机自管的**当前累计值**，非增量）。
 - Coordinator（或每个节点本地）**读取并聚合**这些上报值，形成全局 `disk_stats` 视图用于排序 / 分层；聚合是只读的"汇总"，**不会回写、也不会修改任何节点的本地统计**。
-- 磁盘物理迁移到新节点时，`mountedNodeId` 更新，但 `diskSerial` 与历史 `onlineSeconds` 随磁盘延续（由 §11.2 的 disk-id 文件或序列号承载）。
+- 磁盘物理迁移到新节点时，`mountedNodeId` 更新，但 `diskSerial` 与历史 `onlineSeconds` 随磁盘延续（由 §11.4 的 `.immich-disk-stats` 落盘值承载，不再依赖旧节点上报）。
 - 冲突合并规则：同一 `diskSerial` 被多个来源上报时（如迁移瞬间双节点可见），取 `onlineSeconds` 较大者、`mountedNodeId` 取上报最新者——这只是聚合时的取舍，**不改写任何本地值**。
 
 **全局 `disk_stats` 聚合算法**（Coordinator 在每次决策前执行，纯只读）：
@@ -636,6 +636,26 @@ CREATE INDEX idx_directory_disk ON directory(disk_serial);
 { "...现有字段...": "...", "clusterId": "home-cluster", "clusterRole": "coordinator" }
 ```
 
+### 9.4 磁盘位置路由（diskSerial → node）
+
+任意节点要读取落在某 `diskSerial` 上的副本时，需先知道该盘**当前挂在哪台节点**（拔插后 `mountedNodeId` 会变）。除依赖 Coordinator 内存聚合视图外，提供显式路由接口，使路由不必每次经 Coordinator：
+
+| 接口 | 说明 |
+|------|------|
+| `GET /api/cluster/disk/:diskSerial/location` | 返回该盘当前归属节点：`{nodeId, nodeUrl, online}`，便于直接发起 blob 拉取（§9.2） |
+| （或：在 `GET /api/cluster/state` 响应中附带 `diskLocations: {diskSerial → nodeId}` 映射） | 各节点本地缓存，拔插后下次拉取即更新 |
+
+**路由解析流程**（节点 X 要取 `diskSerial=D` 上的副本）：
+
+```
+1. X 先查本地缓存的 diskLocations；命中且 online → 直接按 nodeUrl 发 GET /api/cluster/blob
+2. 未命中 / 已离线 → 调 GET /api/cluster/disk/:diskSerial/location 实时解析
+3. 仍不可达 → 走 Coordinator 聚合视图兜底，或标记该副本 suspect（§7.2）
+```
+
+- 该接口只读、幂等；返回的"当前可见归属"与 §4.3 聚合的 `mountedNodeId`（取最新上报者）保持一致。
+- 价值：磁盘跨节点拔插后，blob 访问能**自动改道到新节点**；同时把 Coordinator 从"每次路由必经"降级为兜底，减少单点依赖。
+
 ---
 
 ## 10. Coordinator 选举
@@ -711,7 +731,8 @@ CREATE INDEX idx_directory_disk ON directory(disk_serial);
 ```
 1. 读磁盘根 .immich-disk-id（或硬件序列号）→ 得到 diskSerial
 2. 若本机 disk 表无该 diskSerial：
-     - 新建 disk 记录，onlineSeconds 从 0 开始（历史累计值由磁盘上的 .immich-dir.json / 旧节点上报延续，见 §4.3 冲突合并）
+     - 读 .immich-disk-stats（§11.4）得到持久化的 onlineSeconds / firstSeenAt / lastTickAt，
+       作为本机 disk 记录初值继续累加（不从 0 起，也不依赖旧节点上报）
      - 扫描每个月份目录的 .immich-dir.json，批量登记 replica（含 checksum、size、replicaOn）
      - 重建 directory 表对应行（聚合自 .immich-dir.json）
 3. 更新 disk.mounted_node_id = 本机 serverId
@@ -722,6 +743,32 @@ CREATE INDEX idx_directory_disk ON directory(disk_serial);
 
 - 认领是**增量、可重入**的：重复挂载同一磁盘不会重复建表，仅刷新 `mounted_node_id` 与缺失的 replica。
 - 若磁盘被两个节点短暂同时可见（迁移瞬间），以"先完成认领并上报者"为归属；另一方在收到 Coordinator 聚合视图后自动退让该磁盘的归属声明。
+
+### 11.4 磁盘统计落盘（`.immich-disk-stats`）
+
+为使磁盘的"可靠性履历"随盘迁移、不依赖旧节点或 Coordinator 记忆（§4.2、§4.3），把累计在线统计**持久化在磁盘本身**：
+
+**文件格式**（JSON，落于磁盘存储根，如 `Documents/Immich/.immich-disk-stats`）：
+
+```json
+{
+  "diskId": "9f1c2e3a-...",          // 与 .immich-disk-id 对应，便于关联
+  "onlineSeconds": 8640000,          // 累计在线秒数（持久化值）
+  "firstSeenAt": 1770000000,         // 首次被任意节点发现的 epoch 秒
+  "lastTickAt": 1781050000,          // 上次结算时间戳，挂载后从此继续累加
+  "updatedAt": 1781050000
+}
+```
+
+**维护规则**：
+- 挂载该磁盘的节点在每次计时结算（§4.2）后，将 `onlineSeconds` / `lastTickAt` / `firstSeenAt` 写回此文件；为降低写放大，按 `STATS_FLUSH_INTERVAL`（默认 60s）批量刷盘，而非每秒写。
+- `firstSeenAt` 仅在首次生成时写入，之后**不变**（履历起点跟随磁盘）。
+- 磁盘被拔下时，做最后一次刷盘，落定当前累计值。
+- 拔下期间不计入在线（正确）；新节点挂载后从 `lastTickAt` 之后的实际可读时间继续累加。
+
+**与 `.immich-disk-id` 的关系**：`disk-id` 只写一次、作为稳定身份；`disk-stats` 频繁更新、承载履历。两者分离避免每次更新履历都改写身份文件，也缩小格式化以外的意外损坏面。
+
+**容错**：若 `disk-stats` 缺失/损坏，退化为"从 0 起 + 依赖 Coordinator 合并旧节点上报"（原 §4.3 行为），仅分层评分短期失真，不丢数据。
 
 ---
 
@@ -786,6 +833,7 @@ CREATE INDEX idx_directory_disk ON directory(disk_serial);
 | `SAFETY_MARGIN` | 10% | 空间预检/补副本余量（§6.3、§7.2） |
 | `DISK_MIN_FREE_RATIO` | 10% | 每块盘硬预留最小空闲比例（硬底线，§5.5） |
 | `DISK_MIN_FREE_BYTES` | 10 GiB | 每块盘硬预留绝对字节（与比例取 max，§5.5） |
+| `STATS_FLUSH_INTERVAL` | 60s | 磁盘统计落盘批刷新间隔（§11.4） |
 | `MIGRATION_BYTES_PER_CYCLE` | 可配 | 每周期迁移配额（§6.4 收益排序上限） |
 | `TEMP_WEIGHTS` | 0.4/0.5/0.1 | 温度权重 w1/w2/w3 |
 | `OFFLINE_SUSPECT_DAYS` | 30 | 磁盘离线多久视为可疑/掉线降权 |
