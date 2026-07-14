@@ -256,10 +256,17 @@ func (h *Handler) Mux() *http.ServeMux {
 	m.HandleFunc("/api/server/ping", h.handlePing)
 	m.HandleFunc("/api/server-info/ping", h.handlePing)
 	m.HandleFunc("/api/server-info", h.handleServerInfo)
+	m.HandleFunc("/api/server/version", h.handleServerVersion)
+	m.HandleFunc("/api/server/features", h.handleServerFeatures)
+	m.HandleFunc("/api/server/config", h.handleServerConfig)
 	m.HandleFunc("/api/auth/login", h.handleLogin)
 	m.HandleFunc("/api/auth/token-exchange", h.handleTokenExchange)
 	m.HandleFunc("/api/users/me/preferences", h.handleGetMyPreferences)
 	m.HandleFunc("/api/users/me", h.handleGetMe)
+
+	// ---- Immich 客户端同步 API（登录后全量同步）----
+	m.HandleFunc("/api/sync/ack", h.handleSyncAck)
+	m.HandleFunc("/api/sync/stream", h.handleSyncStream)
 
 	// ---- Immich 客户端媒体 API（资产上传/列表/下载/删除），不经集群 HMAC 鉴权 ----
 	m.HandleFunc("/api/assets/bulk-upload-check", h.handleBulkUploadCheck)
@@ -324,6 +331,74 @@ func (h *Handler) handleServerInfo(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// handleServerVersion 实现 Immich /api/server/version：登录表单初始化时读取，
+// 用于版本兼容性判定。必须与移动端 app 主版本一致（app 为 3.0.0），否则登录表单
+// 报 "Your app major version is not compatible with the server!"。见 docs/requirements.md。
+func (h *Handler) handleServerVersion(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"major":      3,
+		"minor":      0,
+		"patch":      0,
+		"prerelease": 0,
+	})
+}
+
+// handleServerFeatures 实现 Immich /api/server/features：登录表单据此决定显示
+// 密码登录 / OAuth 入口。passwordLogin 必须为 true，否则表单不显示密码框。
+func (h *Handler) handleServerFeatures(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"configFile":          true,
+		"duplicateDetection":  false,
+		"email":               false,
+		"facialRecognition":   false,
+		"importFaces":         false,
+		"map":                 true,
+		"oauth":               false,
+		"oauthAutoLaunch":     false,
+		"ocr":                 false,
+		"passwordLogin":       true,
+		"realtimeTranscoding": false,
+		"reverseGeocoding":    false,
+		"search":              true,
+		"sidecar":             false,
+		"smartSearch":         false,
+		"trash":               true,
+	})
+}
+
+// handleServerConfig 实现 Immich /api/server/config：登录表单读取 OAuth 按钮文本等。
+func (h *Handler) handleServerConfig(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"externalDomain":   "",
+		"isInitialized":    true,
+		"isOnboarded":      true,
+		"loginPageMessage": "",
+		"maintenanceMode":  false,
+		"mapDarkStyleUrl":  "https://tiles.immich.cloud/v1/style/dark.json",
+		"mapLightStyleUrl": "https://tiles.immich.cloud/v1/style/light.json",
+		"minFaces":         3,
+		"oauthButtonText":  "",
+		"publicUsers":      false,
+		"trashDays":        30,
+		"userDeleteDelay":  0,
+	})
+}
+
 // handleLogin 实现 Immich /api/auth/login 的最小引导：返回 access token。
 func (h *Handler) handleLogin(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -332,11 +407,14 @@ func (h *Handler) handleLogin(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{
-		"accessToken": randomAccessToken(),
-		"userId":      h.ServerID,
-		"userEmail":   "admin@immich.local",
-		"name":        h.ServerName,
-		"isAdmin":     true,
+		"accessToken":        randomAccessToken(),
+		"userId":             h.ServerID,
+		"userEmail":          "admin@immich.local",
+		"name":               h.ServerName,
+		"isAdmin":            true,
+		"isOnboarded":        true,
+		"profileImagePath":   "",
+		"shouldChangePassword": false,
 	})
 }
 
@@ -439,6 +517,139 @@ func (h *Handler) handleGetMyPreferences(w http.ResponseWriter, r *http.Request)
 			"sidebarWeb": false,
 		},
 	})
+}
+
+// ---- Immich 客户端同步 API（登录后全量同步）----
+
+// handleSyncAck 处理 /api/sync/ack 的三种方法：
+//   - DELETE：pre-sync 迁移任务里删除指定类型的回执（忽略 body，返回 204）
+//   - POST：客户端分批确认已处理的同步事件（忽略 body，返回 204）
+//   - GET：拉取当前会话的回执列表（返回空数组）
+func (h *Handler) handleSyncAck(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodDelete, http.MethodPost:
+		w.WriteHeader(http.StatusNoContent)
+	case http.MethodGet:
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode([]any{})
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+// syncRequestToResponse 将客户端在 /api/sync/stream 请求的同步类型（SyncRequestType）
+// 映射到响应里使用的实体类型（SyncEntityType）。客户端按响应类型反序列化数据。
+var syncRequestToResponse = map[string]string{
+	"AuthUsersV1":         "AuthUserV1",
+	"UsersV1":             "UserV1",
+	"AssetsV1":            "AssetV1",
+	"AssetsV2":            "AssetV2",
+	"AssetExifsV1":        "AssetExifV1",
+	"AssetEditsV1":        "AssetEditV1",
+	"AssetMetadataV1":     "AssetMetadataV1",
+	"AssetOcrV1":          "AssetOcrV1",
+	"PartnersV1":          "PartnerV1",
+	"PartnerAssetsV1":     "PartnerAssetV1",
+	"PartnerAssetsV2":     "PartnerAssetV2",
+	"PartnerAssetExifsV1": "PartnerAssetExifV1",
+	"PartnerStacksV1":     "PartnerStackV1",
+	"AlbumsV1":            "AlbumV1",
+	"AlbumsV2":            "AlbumV2",
+	"AlbumUsersV1":        "AlbumUserV1",
+	"AlbumToAssetsV1":     "AlbumToAssetV1",
+	"AlbumAssetsV1":       "AlbumAssetCreateV1",
+	"AlbumAssetsV2":       "AlbumAssetCreateV2",
+	"AlbumAssetExifsV1":   "AlbumAssetExifCreateV1",
+	"MemoriesV1":          "MemoryV1",
+	"MemoryToAssetsV1":    "MemoryToAssetV1",
+	"StacksV1":            "StackV1",
+	"PeopleV1":            "PersonV1",
+	"AssetFacesV1":        "AssetFaceV1",
+	"AssetFacesV2":        "AssetFaceV2",
+	"UserMetadataV1":      "UserMetadataV1",
+}
+
+// handleSyncStream 实现 Immich /api/sync/stream：登录后客户端据此做一次全量同步。
+// 客户端 POST 一个 SyncStreamDto{types:[...]}，服务器以 JSON-lines（每行一个 JSON 对象）
+// 流式返回每个类型的实体数据，最后以 SyncCompleteV1 标记同步结束。
+// 本最小实现对每个请求类型返回空数据（当前用户类型填充本节点身份），足以让客户端完成同步并进入首页。
+func (h *Handler) handleSyncStream(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		Types []string `json:"types"`
+	}
+	body, _ := io.ReadAll(r.Body)
+	_ = json.Unmarshal(body, &req)
+
+	flusher, _ := w.(http.Flusher)
+	w.Header().Set("Content-Type", "application/jsonlines+json")
+	w.WriteHeader(http.StatusOK)
+
+	now := time.Now().UTC().Format(time.RFC3339)
+	writeLine := func(obj map[string]any) {
+		b, _ := json.Marshal(obj)
+		b = append(b, '\n')
+		_, _ = w.Write(b)
+		if flusher != nil {
+			flusher.Flush()
+		}
+	}
+
+	for _, t := range req.Types {
+		respType, ok := syncRequestToResponse[t]
+		if !ok {
+			continue
+		}
+		data := []any{}
+		switch respType {
+		case "AuthUserV1":
+			data = []any{h.syncAuthUser(now)}
+		case "UserV1":
+			data = []any{h.syncUser(now)}
+		}
+		writeLine(map[string]any{
+			"type": respType,
+			"data": data,
+			"ack":  randomAccessToken(),
+		})
+	}
+	// 同步完成标记：客户端据此结束同步流。
+	writeLine(map[string]any{"type": "SyncCompleteV1", "data": []any{}})
+}
+
+// syncAuthUser 拼出与 SyncAuthUserV1 必填字段对齐的当前（admin）用户。
+func (h *Handler) syncAuthUser(now string) map[string]any {
+	return map[string]any{
+		"id":                h.ServerID,
+		"email":             "admin@immich.local",
+		"name":              h.ServerName,
+		"isAdmin":           true,
+		"hasProfileImage":   false,
+		"oauthId":           "",
+		"pinCode":           nil,
+		"deletedAt":         nil,
+		"profileChangedAt":  now,
+		"quotaSizeInBytes":  nil,
+		"quotaUsageInBytes": 0,
+		"storageLabel":      nil,
+		"avatarColor":       "primary",
+	}
+}
+
+// syncUser 拼出与 SyncUserV1 必填字段对齐的当前（admin）用户。
+func (h *Handler) syncUser(now string) map[string]any {
+	return map[string]any{
+		"id":               h.ServerID,
+		"email":            "admin@immich.local",
+		"name":             h.ServerName,
+		"hasProfileImage":  false,
+		"deletedAt":        nil,
+		"profileChangedAt": now,
+		"avatarColor":      "primary",
+	}
 }
 
 // ---- Immich 客户端媒体 API（§media-api） ----

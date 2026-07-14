@@ -3,10 +3,14 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"io"
+	"log"
 	"net"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
@@ -135,7 +139,14 @@ func (n *Node) Run(ctx context.Context) error {
 			go func() { _ = cr.Run(ctx) }()
 		}
 	}
-	n.server = &http.Server{Handler: n.api.Mux()}
+	// HTTP 调试日志：设置 IMMICH_GO_DEBUG=1 记录每个请求的方法/路径/状态/耗时；
+	// 设置 IMMICH_GO_DEBUG=2 额外 dump 请求体与响应体（仅用于排查“server is not reachable”等）。
+	var handler http.Handler = n.api.Mux()
+	if lvl := os.Getenv("IMMICH_GO_DEBUG"); lvl != "" {
+		handler = httpDebugMiddleware(handler, lvl == "2")
+		log.Printf("[HTTP-DEBUG] enabled (level=%s)", lvl)
+	}
+	n.server = &http.Server{Handler: handler}
 	go func() { _ = n.server.Serve(ln) }()
 
 	if n.discConn != nil {
@@ -359,4 +370,85 @@ func (n *Node) Close() error {
 		_ = n.clientResponder.Close()
 	}
 	return n.store.Close()
+}
+
+// statusRecorder 包装 ResponseWriter 以便记录响应状态码与字节数。
+type statusRecorder struct {
+	http.ResponseWriter
+	status int
+	size   int
+}
+
+func (r *statusRecorder) WriteHeader(code int) {
+	r.status = code
+	r.ResponseWriter.WriteHeader(code)
+}
+
+func (r *statusRecorder) Write(b []byte) (int, error) {
+	if r.status == 0 {
+		r.status = http.StatusOK
+	}
+	n, err := r.ResponseWriter.Write(b)
+	r.size += n
+	return n, err
+}
+
+// httpDebugMiddleware 记录每个 HTTP 请求的 方法/路径/查询/状态/耗时；
+// dumpBody=true 时额外把请求体与响应体（截断到 4KB）打印出来，便于排查连通性问题。
+func httpDebugMiddleware(next http.Handler, dumpBody bool) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var reqBody []byte
+		if dumpBody && r.Body != nil {
+			reqBody, _ = io.ReadAll(io.LimitReader(r.Body, 64<<10))
+			r.Body = io.NopCloser(bytes.NewReader(reqBody)) // 还原，供下游 handler 读取
+		}
+
+		rec := &statusRecorder{ResponseWriter: w, status: 0}
+		var respBuf *bytes.Buffer
+		if dumpBody {
+			respBuf = &bytes.Buffer{}
+			rec.ResponseWriter = &teeResponseWriter{ResponseWriter: w, buf: respBuf}
+		}
+		start := time.Now()
+		next.ServeHTTP(rec, r)
+		if rec.status == 0 {
+			rec.status = http.StatusOK
+		}
+		elapsed := time.Since(start)
+
+		q := r.URL.RawQuery
+		if q != "" {
+			q = "?" + q
+		}
+		log.Printf("[HTTP] %s %s%s -> %d (%dB, %s) from %s",
+			r.Method, r.URL.Path, q, rec.status, rec.size, elapsed, r.RemoteAddr)
+
+		if dumpBody {
+			if len(reqBody) > 0 {
+				log.Printf("[HTTP-BODY] >>> %s", truncate(reqBody, 4096))
+			}
+			if respBuf != nil && respBuf.Len() > 0 {
+				log.Printf("[HTTP-BODY] <<< %s", truncate(respBuf.Bytes(), 4096))
+			}
+		}
+	})
+}
+
+func truncate(b []byte, max int) string {
+	s := string(b)
+	if len(s) > max {
+		return s[:max] + "...(truncated)"
+	}
+	return s
+}
+
+// teeResponseWriter 在把响应写回客户端的同时，把字节复制进 buf（用于调试 dump）。
+type teeResponseWriter struct {
+	http.ResponseWriter
+	buf *bytes.Buffer
+}
+
+func (t *teeResponseWriter) Write(b []byte) (int, error) {
+	t.buf.Write(b)
+	return t.ResponseWriter.Write(b)
 }
