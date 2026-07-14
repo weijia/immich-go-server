@@ -418,6 +418,13 @@ func (s *Store) RelinquishDirectory(dirKey string) error {
 	return err
 }
 
+// DeleteReplica 删除某 asset 在某盘上的一份副本记录（§9.x 真实源盘释放）：
+// 仅删除 asset@srcDisk 这一行，保留该资产在其他盘上的副本。
+func (s *Store) DeleteReplica(assetID, diskSerial string) error {
+	_, err := s.db.Exec(`DELETE FROM replica WHERE asset_id=? AND disk_serial=?`, assetID, diskSerial)
+	return err
+}
+
 // SubmitTask 记录一条集群任务；同一 task_id 幂等（INSERT OR IGNORE）。
 func (s *Store) SubmitTask(task clusterapi.Task) error {
 	_, err := s.db.Exec(`INSERT OR IGNORE INTO task (task_id,type,dir_key,asset_id,src_disk,dst_disk,created_at,status)

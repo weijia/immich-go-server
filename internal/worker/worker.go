@@ -9,6 +9,7 @@ package worker
 import (
 	"context"
 	"fmt"
+	"os"
 	"path/filepath"
 
 	"github.com/weijia/immich-go-server/internal/cluster"
@@ -28,7 +29,8 @@ type Repo interface {
 	GetAsset(assetID string) (model.Asset, bool, error)
 	ListReplicas(assetID string) ([]model.Replica, error)
 	AddReplica(r model.Replica) error
-	SaveDirectory(dir model.Directory) error // 目录重宿主：领养权威记录
+	DeleteReplica(assetID, diskSerial string) error // 真实源盘释放：删源副本记录
+	SaveDirectory(dir model.Directory) error       // 目录重宿主：领养权威记录
 	GetDiskLocation(serial string) (string, bool)
 }
 
@@ -114,25 +116,27 @@ func (w *Worker) runMigration(ctx context.Context, t clusterapi.Task) error {
 	if err != nil {
 		return err
 	}
-	if len(assets) == 0 {
-		// 空目录：仅重宿主元数据
-		return w.rehost(ctx, t, dir, srcNode)
-	}
-	if err := w.copyAssets(t.SrcDisk, t.DstDisk, assets); err != nil {
-		return err
-	}
-	// 登记目标副本（HEALTHY）
-	for _, a := range assets {
-		if err := w.Repo.AddReplica(model.Replica{
-			ReplicaID:  a.AssetID + "@" + t.DstDisk,
-			AssetID:    a.AssetID,
-			DiskSerial: t.DstDisk,
-			NodeID:     w.NodeID,
-			Checksum:   a.Checksum,
-			Status:     "HEALTHY",
-		}); err != nil {
+	if len(assets) > 0 {
+		if err := w.copyAssets(t.SrcDisk, t.DstDisk, assets); err != nil {
 			return err
 		}
+		// 登记目标副本（HEALTHY）—— 在释放源之前确保目标已就绪
+		for _, a := range assets {
+			if err := w.Repo.AddReplica(model.Replica{
+				ReplicaID:  a.AssetID + "@" + t.DstDisk,
+				AssetID:    a.AssetID,
+				DiskSerial: t.DstDisk,
+				NodeID:     w.NodeID,
+				Checksum:   a.Checksum,
+				Status:     "HEALTHY",
+			}); err != nil {
+				return err
+			}
+		}
+	}
+	// 释放源盘：删除源副本记录与（跨节点时）物理字节
+	if err := w.releaseSource(ctx, t, assets, srcNode); err != nil {
+		return err
 	}
 	return w.rehost(ctx, t, dir, srcNode)
 }
@@ -156,6 +160,32 @@ func (w *Worker) rehost(ctx context.Context, t clusterapi.Task, dir model.Direct
 		}
 	}
 	return nil
+}
+
+// releaseSource 迁移完成后释放源盘（§9.x 真实源盘释放）：
+//  1. 删除目录在 SrcDisk 上的源副本记录；
+//  2. 删除源物理字节——仅当目标盘不在本节点时（跨节点源在他节点，或同节点但 dst 在他盘）；
+//     同节点盘间迁移共享同一 BlobBase/<assetID> 文件，删字节会误伤目标副本，故保留。
+// 源在本节点（srcNode==本节点）时本地直接删除；源在远端时经 HMAC 通知源节点代为释放。
+func (w *Worker) releaseSource(ctx context.Context, t clusterapi.Task, assets []model.Asset, srcNode string) error {
+	if srcNode == "" || srcNode == w.NodeID {
+		for _, a := range assets {
+			if err := w.Repo.DeleteReplica(a.AssetID, t.SrcDisk); err != nil {
+				return err
+			}
+		}
+		if dn, ok := w.Loc.DiskNode(t.DstDisk); !ok || dn != w.NodeID {
+			for _, a := range assets {
+				_ = os.Remove(BlobPath(w.BlobBase, a.AssetID))
+			}
+		}
+		return nil
+	}
+	url, ok := w.Loc.PeerURL(srcNode)
+	if !ok {
+		return fmt.Errorf("no peer url for src node %s", srcNode)
+	}
+	return w.Client.ReleaseSource(ctx, url, t.DirKey, t.SrcDisk, t.DstDisk, srcNode)
 }
 
 // runReplica 为某资产在本地 DstDisk 补一份副本；源取一份健康副本所在盘（本节点或远端）。

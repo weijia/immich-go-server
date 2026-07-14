@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strconv"
 	"sync"
 	"time"
@@ -90,6 +92,8 @@ type StateProvider interface {
 	SubmitTask(task Task) error
 	GetDirectory(dirKey string) (model.Directory, bool, error) // 目录重宿主：读本地目录元数据
 	RelinquishDirectory(dirKey string) error                   // 目录重宿主：删除本地陈旧目录记录
+	DeleteReplica(assetID, diskSerial string) error            // 真实源盘释放：删某 asset 在某盘上的副本记录
+	ListAssetsByDir(dirKey string) ([]model.Asset, error)      // 真实源盘释放：列出目录资产以删字节
 }
 
 // BlobSource 提供 blob 字节流的本地来源（执行迁移时其他节点按需拉取，§9.1）。
@@ -109,6 +113,7 @@ type Handler struct {
 	Now      func() int64
 	Provider StateProvider
 	Source   BlobSource // 可选：提供 blob 拉取（§9.1）
+	BlobBase string     // 可选：本节点 blob 扁平根目录，用于源盘释放时删除物理字节
 
 	mu   sync.Mutex
 	seen map[string]bool
@@ -150,6 +155,7 @@ func (h *Handler) Mux() *http.ServeMux {
 	m.HandleFunc("/api/cluster/replica/register", h.auth(h.handleRegisterReplica))
 	m.HandleFunc("/api/cluster/task", h.auth(h.handleSubmitTask))
 	m.HandleFunc("/api/cluster/directory/rehost", h.auth(h.handleRehostDirectory))
+	m.HandleFunc("/api/cluster/directory/release", h.auth(h.handleReleaseSource))
 	m.HandleFunc("/api/cluster/directory/", h.auth(h.handleGetDirectory))
 	m.HandleFunc("/api/cluster/blob/", h.auth(h.handleBlob))
 	return m
@@ -301,6 +307,52 @@ func (h *Handler) handleRehostDirectory(w http.ResponseWriter, r *http.Request) 
 		if err := h.Provider.RelinquishDirectory(req.DirKey); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
+		}
+	}
+	w.WriteHeader(http.StatusOK)
+}
+
+// handleReleaseSource 经 HMAC 鉴权 POST 处理“真实源盘释放”（§9.x）：
+// 仅当本节点正是被要求释放的源节点时才执行——
+//  1. 删除该目录下所有资产在 SrcDisk 上的副本记录；
+//  2. 仅当 DstDisk 不在本节点（GetDiskLocation 未知或挂载他节点）时才删除物理字节，
+//     因为同节点盘间迁移共享同一 BlobBase/<assetID> 文件，删字节会误伤目标副本。
+// 幂等且对称——同一请求发给两端，只有源节点会执行。
+func (h *Handler) handleReleaseSource(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		DirKey      string `json:"dirKey"`
+		SrcDisk     string `json:"srcDisk"`
+		DstDisk     string `json:"dstDisk"`
+		ReleaseNode string `json:"releaseNode"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	if req.DirKey == "" || req.SrcDisk == "" || req.DstDisk == "" || req.ReleaseNode == "" {
+		http.Error(w, "dirKey, srcDisk, dstDisk, releaseNode required", http.StatusBadRequest)
+		return
+	}
+	if req.ReleaseNode == h.NodeID {
+		assets, err := h.Provider.ListAssetsByDir(req.DirKey)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		for _, a := range assets {
+			if err := h.Provider.DeleteReplica(a.AssetID, req.SrcDisk); err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+		}
+		if node, ok := h.Provider.GetDiskLocation(req.DstDisk); !ok || node != h.NodeID {
+			for _, a := range assets {
+				_ = os.Remove(filepath.Join(h.BlobBase, a.AssetID))
+			}
 		}
 	}
 	w.WriteHeader(http.StatusOK)

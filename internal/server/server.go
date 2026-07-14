@@ -65,6 +65,7 @@ func New(cfg Config) (*Node, error) {
 	if cfg.BlobRoot != "" {
 		h.Source = clusterapi.FileSystemBlobSource{Root: cfg.BlobRoot}
 	}
+	h.BlobBase = cfg.BlobRoot // 供源盘释放时删除本节点物理字节
 	n := &Node{cfg: cfg, store: st, api: h, reg: discovery.NewRegistry()}
 
 	if cfg.DiscoverAddr != "" {

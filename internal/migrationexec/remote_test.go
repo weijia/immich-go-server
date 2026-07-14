@@ -18,6 +18,10 @@ func (noopProvider) GetDirectory(string) (model.Directory, bool, error) {
 	return model.Directory{}, false, nil
 }
 func (noopProvider) RelinquishDirectory(string) error { return nil }
+func (noopProvider) DeleteReplica(string, string) error      { return nil }
+func (noopProvider) ListAssetsByDir(string) ([]model.Asset, error) {
+	return nil, nil
+}
 
 const (
 	remoteTestNode   = "node-A"

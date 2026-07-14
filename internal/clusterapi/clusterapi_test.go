@@ -20,6 +20,8 @@ type fakeProvider struct {
 	location map[string]string // diskSerial -> mountedNodeID
 	dirs     map[string]model.Directory
 	relin    []string
+	delRep   []string                     // 已删除的 asset@disk 副本记录
+	assets   map[string][]model.Asset     // dirKey -> 资产（源盘释放用）
 	regs     []string
 	tasks    []Task
 }
@@ -45,6 +47,13 @@ func (f *fakeProvider) RelinquishDirectory(dirKey string) error {
 	delete(f.dirs, dirKey)
 	f.relin = append(f.relin, dirKey)
 	return nil
+}
+func (f *fakeProvider) DeleteReplica(assetID, diskSerial string) error {
+	f.delRep = append(f.delRep, assetID+"@"+diskSerial)
+	return nil
+}
+func (f *fakeProvider) ListAssetsByDir(dirKey string) ([]model.Asset, error) {
+	return f.assets[dirKey], nil
 }
 
 const (
@@ -233,6 +242,45 @@ func TestRehostDirectory(t *testing.T) {
 	}
 	if _, ok := p.dirs["d1"]; ok {
 		t.Error("d1 should be deleted from provider")
+	}
+}
+
+// TestReleaseSource 验证源盘释放端点：
+//  - releaseNode==本节点：删除该目录所有资产在 SrcDisk 上的副本记录；
+//  - releaseNode!=本节点：忽略（幂等对称）。
+func TestReleaseSource(t *testing.T) {
+	assets := map[string][]model.Asset{
+		"d1": {{AssetID: "a1"}, {AssetID: "a2"}},
+	}
+	p := &fakeProvider{assets: assets, delRep: nil}
+	h := newTestHandler(p) // 本节点 = testNode ("node-A")
+
+	// 非本节点：忽略删除
+	body, _ := json.Marshal(map[string]string{
+		"dirKey": "d1", "srcDisk": "DA", "dstDisk": "DB", "releaseNode": "node-Z",
+	})
+	resp := doSigned(t, h, http.MethodPost, "/api/cluster/directory/release", body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", resp.StatusCode)
+	}
+	if len(p.delRep) != 0 {
+		t.Errorf("non-self release should be ignored, got %v", p.delRep)
+	}
+
+	// 本节点：删除 a1@DA, a2@DA
+	body, _ = json.Marshal(map[string]string{
+		"dirKey": "d1", "srcDisk": "DA", "dstDisk": "DB", "releaseNode": testNode,
+	})
+	resp = doSigned(t, h, http.MethodPost, "/api/cluster/directory/release", body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", resp.StatusCode)
+	}
+	got := map[string]bool{}
+	for _, r := range p.delRep {
+		got[r] = true
+	}
+	if !got["a1@DA"] || !got["a2@DA"] {
+		t.Errorf("expected a1@DA,a2@DA deleted, got %v", p.delRep)
 	}
 }
 

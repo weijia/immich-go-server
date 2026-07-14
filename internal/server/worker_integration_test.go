@@ -148,6 +148,21 @@ func TestNodeWorkerCrossNode(t *testing.T) {
 	if _, ok, _ := a.Store().GetDirectory("d1"); ok {
 		t.Errorf("A still has stale directory d1 after rehost")
 	}
+	// 断言 4b（真实源盘释放）：A 上 DA 盘的源副本记录已删除
+	for _, id := range []string{"a1", "a2"} {
+		reps, _ := a.Store().ListReplicas(id)
+		for _, r := range reps {
+			if r.DiskSerial == "DA" {
+				t.Errorf("A still has source replica %s@DA after release", id)
+			}
+		}
+	}
+	// 断言 4c（真实源盘释放）：A 上 DA 盘的物理字节已删除
+	for _, id := range []string{"a1", "a2"} {
+		if _, err := os.Stat(filepath.Join(a.cfg.BlobRoot, id)); !os.IsNotExist(err) {
+			t.Errorf("A blob %s should be released (deleted), stat err=%v", id, err)
+		}
+	}
 	// 断言 5：任务在 B 已标记为 DONE
 	tasks, _ := b.Store().ListTasks()
 	if len(tasks) != 1 || tasks[0].Status != "DONE" {

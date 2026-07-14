@@ -19,7 +19,9 @@ const fedSecret = "shared-cluster-secret"
 
 // fakeProvider 实现 clusterapi.StateProvider，供 httptest 起真实 /state 端点。
 type fakeProvider struct {
-	state clusterapi.StatePayload
+	state  clusterapi.StatePayload
+	delRep []string                 // 已删除的 asset@disk 副本记录
+	assets map[string][]model.Asset // dirKey -> 资产（源盘释放用）
 }
 
 func (f *fakeProvider) GetState() clusterapi.StatePayload { return f.state }
@@ -34,6 +36,13 @@ func (f *fakeProvider) GetDirectory(string) (model.Directory, bool, error) {
 	return model.Directory{}, false, nil
 }
 func (f *fakeProvider) RelinquishDirectory(string) error { return nil }
+func (f *fakeProvider) DeleteReplica(assetID, diskSerial string) error {
+	f.delRep = append(f.delRep, assetID+"@"+diskSerial)
+	return nil
+}
+func (f *fakeProvider) ListAssetsByDir(dirKey string) ([]model.Asset, error) {
+	return f.assets[dirKey], nil
+}
 
 // fakeRepo 内存 coordinator.Repository，供 GlobalRepo 的本地部分与跨节点调度测试。
 type fakeRepo struct {
@@ -185,3 +194,26 @@ func TestGlobalRepoCrossNodeCoordinator(t *testing.T) {
 var _ clusterapi.StateProvider = (*fakeProvider)(nil)
 var _ coordinator.Repository = (*fakeRepo)(nil)
 var _ coordinator.Repository = (*GlobalRepo)(nil)
+
+// TestReleaseSourceClient 验证经 HMAC 鉴权的 ReleaseSource 客户端：
+// 服务端（node-A）收到 releaseNode==node-A 的请求后删除 a1@DA 副本记录。
+func TestReleaseSourceClient(t *testing.T) {
+	p := &fakeProvider{assets: map[string][]model.Asset{"d1": {{AssetID: "a1"}}}}
+	h := clusterapi.NewHandler("node-A", fedSecret, 60, p) // 使用真实时钟，与客户端对齐
+	srv := httptest.NewServer(h.Mux())
+	defer srv.Close()
+
+	c := NewClient("node-B", fedSecret, 60)
+	if err := c.ReleaseSource(context.Background(), srv.URL, "d1", "DA", "DB", "node-A"); err != nil {
+		t.Fatalf("ReleaseSource: %v", err)
+	}
+	found := false
+	for _, r := range p.delRep {
+		if r == "a1@DA" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected a1@DA deleted via client, delRep=%v", p.delRep)
+	}
+}

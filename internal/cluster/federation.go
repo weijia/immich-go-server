@@ -328,6 +328,40 @@ func (c *Client) RehostDirectory(ctx context.Context, baseURL, dirKey, relinquis
 	return nil
 }
 
+// ReleaseSource 经 HMAC 鉴权 POST 通知对端释放源盘（§9.x 真实源盘释放）：
+// 源节点收到后删除其本地源副本记录，并（若 DstDisk 不在该节点）删除物理字节。
+func (c *Client) ReleaseSource(ctx context.Context, baseURL, dirKey, srcDisk, dstDisk, releaseNode string) error {
+	path := "/api/cluster/directory/release"
+	body, err := json.Marshal(struct {
+		DirKey      string `json:"dirKey"`
+		SrcDisk     string `json:"srcDisk"`
+		DstDisk     string `json:"dstDisk"`
+		ReleaseNode string `json:"releaseNode"`
+	}{DirKey: dirKey, SrcDisk: srcDisk, DstDisk: dstDisk, ReleaseNode: releaseNode})
+	if err != nil {
+		return err
+	}
+	now := c.Now()
+	hdr, err := clusterapi.SignHeaders(c.SelfNodeID, c.Secret, http.MethodPost, path, body, now)
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, joinURL(baseURL, path), bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header = hdr
+	resp, err := c.HTTPClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("release source: status %d", resp.StatusCode)
+	}
+	return nil
+}
+
 // joinURL 拼接基址与路径，处理基址尾斜杠。
 func joinURL(base, path string) string {
 	u, err := url.Parse(base)
