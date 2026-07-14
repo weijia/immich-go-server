@@ -187,6 +187,8 @@ disk_stats 据此重算 onlineScore / tier（见 §4.2、§5.1），用于 R1/R2
 
 当某磁盘空闲率低于目标时，触发**下沉迁移**（把该磁盘上最冷的文件迁到更冷的层）。
 
+> **软目标 vs 硬预留**：上表是"平衡决策的期望水位"（软目标），用于指导迁移方向；与之独立的是 **§5.5 磁盘硬预留（Hard Reserve Floor）**——每块盘无论层级，**绝不允许被写到低于该硬底线**。硬底线是安全红线，软目标只是优化偏好；冲突时硬底线优先（例如 Cold 软目标 5%，但硬底线 10%，则 Cold 实际最低保留 10% 空闲，无法追求到 95% 填满）。
+
 ### 5.3 文件冷热与"久远"定义
 
 用 `assetTemperature` 综合评估，越低越冷、越该下沉：
@@ -215,11 +217,12 @@ assetTemperature =
 上传节点在本机按以下顺序选盘（§12.1 第 2 步）：
 
 ```
-候选 = 本机所有在线、且 freeBytes ≥ 文件size×(1+SAFETY_MARGIN) 的磁盘
+候选 = 本机所有在线、且 写入后空闲 ≥ 硬底线(§5.5) 的磁盘
+     （即 freeBytes - 文件size ≥ max(capacity×DISK_MIN_FREE_RATIO, DISK_MIN_FREE_BYTES)）
 按 tier 优先级 + 写入后水位余量排序：
-  1) 优先 Hot 层（主副本默认热层），但写入后剩余空闲率须 ≥ HOT_FREE_TARGET
+  1) 优先 Hot 层（主副本默认热层），且写入后剩余空闲率须 ≥ HOT_FREE_TARGET
   2) 否则 Warm 层（写入后 ≥ WARM_FREE_TARGET）
-  3) 否则 Cold 层（最后兜底）
+  3) 否则 Cold 层（最后兜底，但仍须满足硬底线）
 若候选为空 → 该节点返回 507 Storage Full，客户端可重试其它在线节点
 ```
 
@@ -237,6 +240,26 @@ assetTemperature =
 
 **(e) 副本与空间的口径**
 - `free_bytes` 为磁盘物理剩余；副本与原文件一视同仁占用空间，水位与预检均基于物理剩余，无需区分副本/主本。
+
+### 5.5 磁盘硬预留（Hard Reserve Floor）
+
+为防止"任何一块盘被写到太满"导致写失败、文件系统性能劣化或无法承载突发写入，引入**全局硬预留底线**，对每一块盘（不分层级）强制生效：
+
+| 配置 | 默认 | 说明 |
+|------|------|------|
+| `DISK_MIN_FREE_RATIO` | 10% | 每块盘保留的最小空闲**比例**（硬底线） |
+| `DISK_MIN_FREE_BYTES` | 10 GiB | 保留的**绝对字节数**（与比例取 **max**，防止小盘比例够但绝对值过小） |
+
+**强制规则（所有写路径共用）**：
+- 任何写操作（新上传主副本、补副本、迁移复制）落盘前，必须保证**写入后剩余空闲 ≥ `max(capacity×DISK_MIN_FREE_RATIO, DISK_MIN_FREE_BYTES)`**。
+- 不满足 → 该写操作**被拒绝 / 改选其它盘**，绝不越过硬底线（即使软目标允许更满）。
+- 硬底线独立于 §5.2 的层软目标：Hot/Warm 本就高于底线自然满足；Cold 软目标 5% 低于底线 10%，此时以 10% 为准。
+
+**与现有逻辑的衔接**：
+- 写时分配（§5.4(b)）：候选盘除满足层软目标外，还须满足硬底线；Cold 兜底时也检查底线。
+- 空间预检（§6.3）：`required` 在 `dirSize×(1+SAFETY_MARGIN)` 基础上，再额外预留硬底线空间，复制后空闲不低于底线。
+- 副本选择（§7.2）：排除条件增加"写入后空闲 < 硬底线"。
+- 水位触发（§5.4(c)）：硬底线是比软目标更严格的预警线；任意盘逼近硬底线即触发紧急下沉，不必等到跌破软目标。
 
 ---
 
@@ -278,10 +301,11 @@ assetTemperature =
 ```
 对每个候选目标磁盘 D：
     required = 源目录总字节数 × (1 + SAFETY_MARGIN)   // 含碎片/增长余量
-    if D.freeBytes >= required:
+    floor    = max(D.capacity × DISK_MIN_FREE_RATIO, DISK_MIN_FREE_BYTES)  // 硬预留(§5.5)
+    if D.freeBytes >= required + floor:   // 复制后空闲仍 ≥ 硬底线
         D 进入可用目标列表
     else:
-        跳过 D（空间不足）
+        跳过 D（空间不足或会突破硬预留）
 if 无可用目标: 放弃本次迁移，下周期重试 / 触发空间告警
 ```
 
@@ -391,7 +415,7 @@ for each asset (未删除):
 候选 = 所有 last_seen_at 在 OFFLINE_SUSPECT_DAYS 内（近期可见）的磁盘
 排除：
   - 已持有该 asset 任一副本的 diskSerial（反亲和：同盘不重复）
-  - freeBytes < asset.size × (1 + SAFETY_MARGIN)（空间不足）
+  - freeBytes - asset.size < max(capacity×DISK_MIN_FREE_RATIO, DISK_MIN_FREE_BYTES)（空间不足或会突破硬预留 §5.5）
   - 若现有副本都在同一节点，则优先排除该节点（尽量跨节点）
 按优先级打分选 1 块：
   1) 层分布加分：现有副本在热/温层时，冷层磁盘 +2 分（鼓励 1 热 + 1 冷）
@@ -760,6 +784,8 @@ CREATE INDEX idx_directory_disk ON directory(disk_serial);
 | `COLD_SCORE_THRESHOLD` | 0.4 | 冷层阈值（亦作 `COLD_TEMP_THR`，§6.4 下沉判定） |
 | `HOT_FREE_TARGET` | 40% | 热层目标空闲率 |
 | `SAFETY_MARGIN` | 10% | 空间预检/补副本余量（§6.3、§7.2） |
+| `DISK_MIN_FREE_RATIO` | 10% | 每块盘硬预留最小空闲比例（硬底线，§5.5） |
+| `DISK_MIN_FREE_BYTES` | 10 GiB | 每块盘硬预留绝对字节（与比例取 max，§5.5） |
 | `MIGRATION_BYTES_PER_CYCLE` | 可配 | 每周期迁移配额（§6.4 收益排序上限） |
 | `TEMP_WEIGHTS` | 0.4/0.5/0.1 | 温度权重 w1/w2/w3 |
 | `OFFLINE_SUSPECT_DAYS` | 30 | 磁盘离线多久视为可疑/掉线降权 |
