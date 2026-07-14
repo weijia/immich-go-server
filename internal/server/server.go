@@ -164,7 +164,18 @@ func (n *Node) Federate(ctx context.Context) (cluster.GlobalView, error) {
 		Peers:      cps,
 		Client:     cluster.NewClient(n.cfg.NodeID, n.cfg.Secret, n.cfg.MaxSkew),
 	}
-	return fed.Run(ctx)
+	gv, err := fed.Run(ctx)
+	if err != nil {
+		return gv, err
+	}
+	// 把跨节点聚合出的目录放置图持久化进本地库（§8.6 控制面）：
+	// 单节点下线后其目录记录仍保留在本节点，Coordinator 可据此决策重宿主/再均衡。
+	for _, d := range gv.Directories {
+		if err := n.store.SaveDirectory(d); err != nil {
+			return gv, err
+		}
+	}
+	return gv, nil
 }
 
 // GlobalRepository 基于全局视图构造 coordinator.Repository：磁盘来自跨节点合并，

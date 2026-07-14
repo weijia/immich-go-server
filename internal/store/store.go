@@ -54,7 +54,8 @@ CREATE TABLE IF NOT EXISTS directory (
   tier         TEXT,
   temperature  REAL,
   total_bytes  INTEGER,
-  access_score REAL
+  access_score REAL,
+  last_eval_at INTEGER DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS asset (
   asset_id   TEXT PRIMARY KEY,
@@ -246,18 +247,25 @@ WHERE r.asset_id=? AND d.suspect=0`, assetID).Scan(&n)
 
 // ---- directory ----
 
-// SaveDirectory 插入或更新月份目录聚合视图（§8.5）。
+// SaveDirectory 插入或更新月份目录聚合视图（§8.5 / §8.6）。
+// 作为"控制面放置图"的 LWW upsert：仅在传入 LastEvalAt 更新（更大）时才覆盖，
+// 避免拉取到的较旧副本把本节点刚写的最新放置冲掉。本地权威写入若不显式带
+// LastEvalAt（==0）则默认取当前时刻，保证本地新写总能胜出。
 func (s *Store) SaveDirectory(dir model.Directory) error {
-	_, err := s.db.Exec(`INSERT INTO directory (dir_key,node_id,disk_serial,tier,temperature,total_bytes,access_score) VALUES (?,?,?,?,?,?,?)
+	if dir.LastEvalAt == 0 {
+		dir.LastEvalAt = time.Now().UnixNano()
+	}
+	_, err := s.db.Exec(`INSERT INTO directory (dir_key,node_id,disk_serial,tier,temperature,total_bytes,access_score,last_eval_at) VALUES (?,?,?,?,?,?,?,?)
 ON CONFLICT(dir_key) DO UPDATE SET node_id=excluded.node_id, disk_serial=excluded.disk_serial, tier=excluded.tier,
-  temperature=excluded.temperature, total_bytes=excluded.total_bytes, access_score=excluded.access_score`,
-		dir.DirKey, dir.NodeID, dir.DiskSerial, string(dir.Tier), dir.Temperature, dir.TotalBytes, dir.AccessScore)
+  temperature=excluded.temperature, total_bytes=excluded.total_bytes, access_score=excluded.access_score, last_eval_at=excluded.last_eval_at
+WHERE excluded.last_eval_at > directory.last_eval_at`,
+		dir.DirKey, dir.NodeID, dir.DiskSerial, string(dir.Tier), dir.Temperature, dir.TotalBytes, dir.AccessScore, dir.LastEvalAt)
 	return err
 }
 
-// ListDirectories 返回所有目录。
+// ListDirectories 返回所有目录（含跨节点聚合持久化后的全局放置图，§8.6）。
 func (s *Store) ListDirectories() ([]model.Directory, error) {
-	rows, err := s.db.Query(`SELECT dir_key,node_id,disk_serial,tier,temperature,total_bytes,access_score FROM directory`)
+	rows, err := s.db.Query(`SELECT dir_key,node_id,disk_serial,tier,temperature,total_bytes,access_score,last_eval_at FROM directory`)
 	if err != nil {
 		return nil, err
 	}
@@ -266,7 +274,7 @@ func (s *Store) ListDirectories() ([]model.Directory, error) {
 	for rows.Next() {
 		var d model.Directory
 		var tier string
-		if err := rows.Scan(&d.DirKey, &d.NodeID, &d.DiskSerial, &tier, &d.Temperature, &d.TotalBytes, &d.AccessScore); err != nil {
+		if err := rows.Scan(&d.DirKey, &d.NodeID, &d.DiskSerial, &tier, &d.Temperature, &d.TotalBytes, &d.AccessScore, &d.LastEvalAt); err != nil {
 			return nil, err
 		}
 		d.Tier = model.Tier(tier)
@@ -353,7 +361,7 @@ func (s *Store) UpdateTaskStatus(taskID, status string) error {
 
 // GetDirectory 读取单个月份目录视图。
 func (s *Store) GetDirectory(dirKey string) (model.Directory, bool, error) {
-	rows, err := s.db.Query(`SELECT dir_key,node_id,disk_serial,tier,temperature,total_bytes,access_score FROM directory WHERE dir_key=?`, dirKey)
+	rows, err := s.db.Query(`SELECT dir_key,node_id,disk_serial,tier,temperature,total_bytes,access_score,last_eval_at FROM directory WHERE dir_key=?`, dirKey)
 	if err != nil {
 		return model.Directory{}, false, err
 	}
@@ -363,7 +371,7 @@ func (s *Store) GetDirectory(dirKey string) (model.Directory, bool, error) {
 	}
 	var d model.Directory
 	var tier string
-	if err := rows.Scan(&d.DirKey, &d.NodeID, &d.DiskSerial, &tier, &d.Temperature, &d.TotalBytes, &d.AccessScore); err != nil {
+	if err := rows.Scan(&d.DirKey, &d.NodeID, &d.DiskSerial, &tier, &d.Temperature, &d.TotalBytes, &d.AccessScore, &d.LastEvalAt); err != nil {
 		return model.Directory{}, false, err
 	}
 	d.Tier = model.Tier(tier)
@@ -413,8 +421,11 @@ func (s *Store) UpdateDirectoryDisk(dirKey, diskSerial string) error {
 
 // RelinquishDirectory 删除本地目录聚合记录（§9.x 目录跨节点重宿主）：
 // 当目录数据已迁到他节点后，源节点应放弃其陈旧的目录视图。
+// RelinquishDirectory 目录重宿主时放弃本地陈旧的目录放置记录（§9.x）。
+// 升格为全局放置图（§8.6）后，目录行按 dir_key 唯一且记录最新 owner；
+// 为避免误删对端刚写的最新放置，仅当本节点仍是该记录的登记 owner 时才删除。
 func (s *Store) RelinquishDirectory(dirKey string) error {
-	_, err := s.db.Exec(`DELETE FROM directory WHERE dir_key=?`, dirKey)
+	_, err := s.db.Exec(`DELETE FROM directory WHERE dir_key=? AND node_id=?`, dirKey, s.nodeID)
 	return err
 }
 
@@ -451,7 +462,13 @@ func (s *Store) GetState() clusterapi.StatePayload {
 			OnlineSeconds: d.OnlineSeconds,
 		})
 	}
-	return clusterapi.StatePayload{NodeID: s.nodeID, Disks: out}
+	// 目录放置图作为控制面随 /state 上报（§8.6），供对端拉取聚合。
+	dirs, _ := s.ListDirectories()
+	ddtos := make([]clusterapi.DirectoryDTO, 0, len(dirs))
+	for _, d := range dirs {
+		ddtos = append(ddtos, clusterapi.DirectoryFromModel(d))
+	}
+	return clusterapi.StatePayload{NodeID: s.nodeID, Disks: out, Directories: ddtos}
 }
 
 // GetDiskLocation 返回磁盘当前挂载节点（§9.4）。

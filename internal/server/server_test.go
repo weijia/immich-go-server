@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/weijia/immich-go-server/internal/cluster"
 	"github.com/weijia/immich-go-server/internal/clusterapi"
 	"github.com/weijia/immich-go-server/internal/model"
 )
@@ -209,4 +210,120 @@ func TestNodeFederate(t *testing.T) {
 		t.Errorf("self node id=%s", gv.SelfNodeID)
 	}
 	_ = addrA // A 自身地址在测试中未直接使用
+}
+
+// TestNodeFederateRetainsOfflineDirectories 验证 §8.6 核心保证：
+// B、C 在线时 A.Federate 把它们的目录放置图聚合并持久化进本机库；
+// B、C 下线后，再次 Federate 虽因拉取失败而报错，但 A 本地库仍保留
+// B、C 的目录记录（含 owner 节点与所在盘），Coordinator 据此仍可决策重宿主。
+func TestNodeFederateRetainsOfflineDirectories(t *testing.T) {
+	mk := func(id string) *Node {
+		dir := t.TempDir()
+		db := filepath.Join(dir, "s.db")
+		n, err := New(Config{NodeID: id, Secret: "sec", ListenAddr: "127.0.0.1:0", DBPath: db})
+		if err != nil {
+			t.Fatalf("New %s: %v", id, err)
+		}
+		return n
+	}
+	a := mk("A")
+	b := mk("B")
+	c := mk("C")
+	defer a.Close()
+	defer b.Close()
+	defer c.Close()
+
+	ctxA, cancelA := context.WithCancel(context.Background())
+	ctxB, cancelB := context.WithCancel(context.Background())
+	ctxC, cancelC := context.WithCancel(context.Background())
+	defer cancelA()
+	defer cancelB()
+	defer cancelC()
+
+	go func() { _ = a.Run(ctxA) }()
+	go func() { _ = b.Run(ctxB) }()
+	go func() { _ = c.Run(ctxC) }()
+	addrB := waitAddr(t, b)
+	addrC := waitAddr(t, c)
+	_ = waitAddr(t, a)
+
+	// 各节点存盘，并在本机登记各自拥有的目录放置图（控制面）
+	if err := a.Store().SaveDisk(model.Disk{DiskSerial: "DA", Tier: model.TierHot, MountedNodeID: "A", OnlineSeconds: 300}); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Store().SaveDisk(model.Disk{DiskSerial: "DB", Tier: model.TierWarm, MountedNodeID: "B", OnlineSeconds: 500}); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Store().SaveDisk(model.Disk{DiskSerial: "DC", Tier: model.TierCold, MountedNodeID: "C", OnlineSeconds: 400}); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Store().SaveDirectory(model.Directory{DirKey: "2026/05", NodeID: "A", DiskSerial: "DA", Tier: model.TierHot, TotalBytes: 10}); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Store().SaveDirectory(model.Directory{DirKey: "2026/06", NodeID: "B", DiskSerial: "DB", Tier: model.TierWarm, TotalBytes: 20}); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Store().SaveDirectory(model.Directory{DirKey: "2026/07", NodeID: "C", DiskSerial: "DC", Tier: model.TierCold, TotalBytes: 30}); err != nil {
+		t.Fatal(err)
+	}
+
+	// 把 B、C 地址注入 A 的 registry（模拟发现）
+	a.Registry().Upsert("B", addrB, time.Now().Unix())
+	a.Registry().Upsert("C", addrC, time.Now().Unix())
+
+	// 首次 Federate：B、C 在线 → 成功聚合并持久化目录放置图
+	if _, err := a.Federate(ctxA); err != nil {
+		t.Fatalf("Federate (online): %v", err)
+	}
+	assertDirOwner := func(key, wantOwner, wantDisk string) {
+		dirs, err := a.Store().ListDirectories()
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := map[string]model.Directory{}
+		for _, d := range dirs {
+			got[d.DirKey] = d
+		}
+		d, ok := got[key]
+		if !ok {
+			t.Fatalf("directory %s not found in A's store after federate: %+v", key, got)
+		}
+		if d.NodeID != wantOwner {
+			t.Errorf("directory %s owner: want %s got %s", key, wantOwner, d.NodeID)
+		}
+		if d.DiskSerial != wantDisk {
+			t.Errorf("directory %s disk: want %s got %s", key, wantDisk, d.DiskSerial)
+		}
+	}
+	assertDirOwner("2026/05", "A", "DA")
+	assertDirOwner("2026/06", "B", "DB") // 来自远端 B，证明跨节点拉取+持久化成功
+	assertDirOwner("2026/07", "C", "DC") // 来自远端 C
+
+	// 让 B、C 下线：取消其运行上下文，HTTP 监听随之关闭
+	cancelB()
+	cancelC()
+	time.Sleep(150 * time.Millisecond)
+
+	// 再次 Federate：B、C 已不可达 → 应返回错误（拉取失败）
+	if _, err := a.Federate(ctxA); err == nil {
+		t.Fatal("expected Federate to fail after B,C offline, got nil")
+	}
+
+	// 关键断言：A 本地库仍保留 B、C 的目录放置记录（设计保证：离线仍可见）
+	assertDirOwner("2026/06", "B", "DB")
+	assertDirOwner("2026/07", "C", "DC")
+
+	// 并以全局仓储视角确认 Coordinator 读到的目录包含离线节点的放置图
+	repo := cluster.GlobalRepo{Local: a.Store(), SelfID: "A", Disks: map[string]model.Disk{}}
+	rd, err := repo.ListDirectories()
+	if err != nil {
+		t.Fatal(err)
+	}
+	present := map[string]bool{}
+	for _, d := range rd {
+		present[d.DirKey] = true
+	}
+	if !present["2026/06"] || !present["2026/07"] {
+		t.Fatalf("GlobalRepo still missing offline directories: %+v", present)
+	}
 }

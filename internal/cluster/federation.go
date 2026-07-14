@@ -131,11 +131,12 @@ type Peer struct {
 }
 
 // GlobalView 跨节点聚合后的全局视图（§9 / §10）：
-// 所有磁盘按 diskSerial 合并；并选出协调者节点。
+// 所有磁盘按 diskSerial 合并；目录放置图按 dir_key LWW 合并；并选出协调者节点。
 type GlobalView struct {
 	SelfNodeID  string
 	Nodes       []string
 	Disks       map[string]model.Disk
+	Directories map[string]model.Directory
 	Coordinator string
 }
 
@@ -158,6 +159,7 @@ func (f *Federation) Run(ctx context.Context) (GlobalView, error) {
 		nodes = append(nodes, nodeFromState(sp.NodeID, sp))
 	}
 	merged := AggregateDiskStats(nodes)
+	mergedDirs := AggregateDirectoryStats(nodes)
 	ids := make([]string, 0, len(nodes))
 	for _, n := range nodes {
 		ids = append(ids, n.NodeID)
@@ -167,6 +169,7 @@ func (f *Federation) Run(ctx context.Context) (GlobalView, error) {
 		SelfNodeID:  f.SelfNodeID,
 		Nodes:       ids,
 		Disks:       merged,
+		Directories: mergedDirs,
 		Coordinator: ElectCoordinator(nodes),
 	}, nil
 }
@@ -185,7 +188,11 @@ func nodeFromState(nodeID string, sp clusterapi.StatePayload) model.Node {
 		})
 		score += float64(d.OnlineSeconds)
 	}
-	return model.Node{NodeID: nodeID, OnlineScore: score, Disks: disks}
+	dirs := make([]model.Directory, 0, len(sp.Directories))
+	for _, d := range sp.Directories {
+		dirs = append(dirs, d.ToModel())
+	}
+	return model.Node{NodeID: nodeID, OnlineScore: score, Disks: disks, Directories: dirs}
 }
 
 // GlobalRepo 把全局聚合视图适配为 coordinator.Repository（§6 / §9.2）：

@@ -674,7 +674,7 @@ CREATE INDEX idx_directory_disk ON directory(disk_serial);
 - 访问热度汇总（§6.1）落地时刷新 `access_score` / `temperature`。
 - Coordinator 每月初评估前，可先 `SELECT * FROM directory WHERE dir_key = 'YYYY/MM'`，O(目录数) 完成决策，不再扫描文件。
 
-> 该表是**派生缓存**，可从 `asset` / `replica` / `asset_access` 重建，丢失不致命。
+> 该表本是**派生缓存**，可从 `asset` / `replica` / `asset_access` 重建；按 §8.6 设计升格为**跨节点共享的控制面放置图**，经 `/state` 拉取聚合并持久化到本机库，单节点下线不丢失，是全局均衡决策的关键输入。
 
 ### 8.5.1 磁盘级目录清单 `.immich-dir.json`（随盘自描述，R3 辅助）
 
@@ -707,6 +707,106 @@ CREATE INDEX idx_directory_disk ON directory(disk_serial);
 
 ---
 
+## 8.6 元数据可见性分层：控制面共享 vs 数据面本地
+
+> 本节是对 §8.1–§8.5 数据模型的**可见性补充**：同样这些表，哪些需要在集群内**全局可见**、哪些只需**本机持有**。设计目标是用最小的跨节点共享数据量，消除"节点下线后无人知道该均衡"的盲点（见 §8.6.1）。
+> 代码现状（immich-go-server 实现）：`GlobalRepo` 仅对 `disk` 做跨节点聚合（`ListDisks` 走 `AggregateDiskStats`），而 `ListDirectories` / `ListAssets` / `ListReplicas` 全部走**本机本地库**——即目前目录、资产、副本三类元数据都不跨节点可见。本节的改动即把"目录放置图"提升为跨节点共享，其余保持不变。
+
+### 8.6.1 问题：当前元数据可见性盲点
+
+按现状实现，副本元数据（`replica` 表）只登记在**持有那块盘的节点**本地，从不回传、不汇总：
+
+- 链式迁移 `A→B→C` 后，`asset@DiskC` 只存在于 C 的库；A、B 对该副本一无所知。
+- 更致命的是节点下线场景：B、C 同时离线时，它们库里的 `replica` 与 `directory` 记录随节点不可达而**从决策视野消失**。
+- Coordinator 的补副本逻辑只看本地 `ReplicaCount`（`coordinator.go` 的 `RunBalancingCycle`），于是：
+  - 对"存活节点本地恰好持有一份"的尾巴数据 → 能触发补副本（本地计数 `< MinReplicas`）；
+  - 对"只活在 B、C 上"的数据 → A 的 `ListAssets` 里根本没有它，**既丢了也看不见该补**。
+- 磁盘级（`disk`）因走 `/state` 聚合，B、C 下线后其盘在全局视图中仍可被 `graceOffline` 宽限后由存活节点认领（§11.3），但**目录级与文件级元数据没有同等机制**。
+
+结论：需要让"足够做全局均衡决策"的元数据跨节点可见，但又不能把最庞大的文件级 `replica` 表全量广播。
+
+### 8.6.2 原则：控制面共享、数据面本地
+
+把元数据切成两层：
+
+| 层 | 内容 | 跨节点可见性 | 量级 |
+|----|------|--------------|------|
+| **控制面（共享）** | `disk`（磁盘清单/分层/容量）+ `directory`（目录放置图：哪个目录在哪块盘、什么层/温度） | **全局共享 / 复制到每个节点** | 极小：磁盘 = O(盘数)；目录 = O(月份数)，远小于文件数 |
+| **数据面（本地）** | `replica`（文件级副本分布）、`asset`、`asset_access`、blob 字节 | **仅本机持有，绝不复制** | 庞大：`replica` = O(文件数 × 副本数)，是真正的体量大头 |
+
+- 共享数据量小、且是均衡/迁移决策的**全部所需输入**（Coordinator 要知道"有哪些目录、各落在哪块盘、所有磁盘的容量与层"——这些都在控制面）。
+- 文件级 `replica` 留在本地：某节点只在自己要服务/修复该文件时才需要它，无需广播；复制它违背"共享数据少"的初衷。
+
+### 8.6.3 控制面内容（disk + directory）
+
+- **`disk`**：已在 §8.1 定义，且经 `/state` 上报 + `AggregateDiskStats` 聚合（§4.3），本就是控制面。无需额外改动。
+- **`directory`（目录放置图）**：§8.5 定义的聚合视图，需从"本机缓存"升格为"跨节点共享放置图"。每个节点本地维护一份 **全局目录放置表**（下称 `directory_global`），内容为集群内**所有**月份目录的 `dir_key / node_id / disk_serial / tier / temperature / total_bytes / access_score / last_eval_at`。
+
+### 8.6.4 数据面内容（replica + asset + blob）
+
+- **`replica` / `asset` / `asset_access`**：严格本机持有。即使 B、C 离线，其 `replica` 记录也不必被其他节点复制——修复路径见 §8.6.7（靠磁盘认领 + 盘上 `.immich-dir.json` 重建，而非复制巨大索引）。
+- **blob 字节**：永远只在物理盘上，随 `diskSerial` 走；跨节点只通过 §9.2 的 `GET /blob` 按需拉取。
+
+### 8.6.5 目录放置图的共享机制（拉取聚合 + 持久化，与磁盘级一致）
+
+复用 §4.3 磁盘的 `/state` 拉取聚合机制，使目录放置图成为**每个节点本地都持有的全量控制面**，而非 owner 单点上报：
+
+```
+1. 各节点 /state 响应携带本机 directory 表（§9.1 的 directories 数组）
+2. Coordinator/各节点 Federate 时：
+     - AggregateDirectoryStats(peers) 按 dir_key LWW 合并（last_eval_at 较大者胜，
+       平票取 nodeId 较大者，§cluster.AggregateDirectoryStats）
+     - 把合并结果 upsert 进本机 directory 表（SaveDirectory 的 LWW 写入）
+3. 任一节点崩溃重启 / 周期评估时，本机 directory 表已是全集群目录放置图
+```
+
+关键点——**与"各自上报"的本质区别在持久化**：聚合结果写入本机库（`Node.Federate` 中 `store.SaveDirectory`），而非仅存于内存。因此 B、C 下线后，A 的本地 `directory` 表仍保留 `d1 → disk D-B(offline)` 记录 → Coordinator 在 A 上仍能看见"该目录位于已离线的盘"并据此决策。磁盘级聚合（§4.3）只在内存、不持久化，所以磁盘离线后会从视图消失；目录级刻意持久化以换取"离线仍可见"。
+
+- `last_eval_at` 采用**纳秒级**时间戳（`time.Now().UnixNano()`），避免同秒连续写入被 LWW 误判为相等而跳过更新。
+- 目录变化频率极低（每月初评估 + 迁移时更新），聚合/持久化开销可忽略。
+- 因每个节点都持有全量目录放置图，B、C 离线不影响全局决策可见性。
+
+### 8.6.6 节点下线后的行为（B、C 离线时）
+
+| 数据 | B、C 离线后 A 是否可见 | 能否据此均衡 |
+|------|------------------------|--------------|
+| `disk`（D-B/D-C） | 可见（/state 聚合 + `graceOffline` 后可认领） | 能：标记离线、触发重宿主 |
+| `directory`（d1 在 D-B） | **可见**（§8.6.5 复制全量） | 能：Coordinator 知"d1 需重宿主/再均衡" |
+| `replica`（d1 内各文件副本分布） | **不可见**（数据面本地） | 不能直接发 `REPLICA` 任务修复 |
+| `asset`（d1 内文件清单） | 不可见（数据面本地） | 同上 |
+
+即：**共享目录放置图让"迁移/重宿主决策"全局正确；文件级副本修复仍受数据面本地限制**——这正是 §8.6.7 要补的闭环。
+
+### 8.6.7 与 §11.3 磁盘认领 / §8.5.1 目录清单的衔接（修复盲点的闭环）
+
+文件级修复的盲区靠**磁盘认领 + 盘上自描述清单**闭合，而非复制 `replica` 表：
+
+- B、C 离线超 `graceOffline` 后，A 认领 D-B（§11.3）：扫描该盘每个月份目录的 `.immich-dir.json`（§8.5.1），**批量重建本地 `replica` / `asset` 索引**。
+- 此时 A 的 `directory_global` 已知"d1 曾在 D-B"，认领后把 `d1.disk_serial` 更新为 A 本地盘、并复制该变更 → 目录放置图收敛。
+- 重建出的 `replica` 若使某 asset 副本数 `< MinReplicas`，A 本地的 `CheckReplicas`（§7.2）即可正常下发补副本任务。
+
+> 因此本设计是自洽的：**目录级共享负责"决策可见性"（小数据量），文件级修复靠"认领盘 + 扫盘上清单重建索引"（不复制大索引）**。二者配合，B、C 离线后既能正确决策、又能最终自愈，而跨节点共享的数据量始终维持在小头。
+
+### 8.6.8 能解决 / 不能解决（边界）
+
+**能解决**：
+- 迁移/重宿主决策全局正确：任意存活节点都持有全量目录放置图，B、C 离线也能看见"哪些目录落在离线盘"并触发再均衡。
+- 共享数据量小：`disk + directory` 远小于 `replica`，符合"共享数据少"。
+
+**仍受限 / 需配合其它机制**：
+- 纯"文件级副本修复"在 B、C 离线期间、且盘尚未被认领前，A 无法主动发起（因 `replica` 本地且 B、C 不可达）。该窗口由 §11.3 认领 + `.immich-dir.json` 重建兜底，属"恢复后自愈"而非"实时在线修复"。
+- 若 B、C 的盘**永久丢失且未认领**（物理损毁），则其上独有的文件确为丢失——这超出副本修复范畴，由 R3 + 周期性健康检查（§7.2）在仍有其它副本时兜底。
+
+### 8.6.9 对现有章节的改动点
+
+- **§8.5 `directory` 表**：由"本机派生缓存"升格为"跨节点共享的控制面放置图"，经 `/state` 拉取聚合并**持久化到本机库**，单节点下线不丢失（见 §8.6.5）。
+- **§9.1 `/state` payload**：新增 `directories` 数组（本节点 `directory` 全量），作为对端拉取聚合的源；全量经 `/state` 拉取聚合 + 持久化（§8.6.5），不依赖单点上报。
+- **§4.3 聚合**：新增 `AggregateDirectoryStats` 按 dir_key 做 LWW 合并（last_eval_at 较大者胜）；聚合结果写入本机库，使目录放置图在节点离线后仍保留。
+- **§16 代码衔接**：`Coordinator` 的 `ListDirectories` 读本机持久化后的 `directory` 表（已含全量）；`ListReplicas` / `ListAssets` 保持读本机（数据面）。
+- **实现注**：采用与磁盘级一致的 `/state` 拉取聚合（而非独立 push 端点），目录行按 `dir_key` 唯一、带 `last_eval_at` 纳秒级 LWW；`RelinquishDirectory` 改为仅删本节点是 owner 的记录，避免误删对端最新放置。
+
+---
+
 ## 9. 集群协议与 API
 
 > 复用现有 `serverToken`/HMAC 做节点间鉴权；下列为集群内 HTTP 接口（拟新增 `/api/cluster/*`）。
@@ -729,12 +829,18 @@ CREATE INDEX idx_directory_disk ON directory(disk_serial);
     {"diskSerial": "WD-1234", "capacityBytes": 512000000000,
      "freeBytes": 300000000000, "onlineSeconds": 8640000, "firstSeenAt": 1770000000}
   ],
+  "directories": [
+    {"dirKey": "2026/06", "diskSerial": "WD-1234", "tier": "COLD",
+     "temperature": 0.3, "totalBytes": 256000000000, "lastEvalAt": 1781050000}
+  ],
   "accessDelta": [
     {"assetId": "a1", "accessCount": 3, "lastAccessAt": 1781050000}
   ],
   "signature": "hmac-sha256..."
 }
 ```
+
+> `directories` 为本节点 `directory` 表全量，作为对端 `/state` 拉取聚合的源；目录放置图经拉取聚合后**持久化到本机库**（§8.6.5），单节点下线仍保留，不依赖单点上报。
 
 ### 9.2 副本与迁移
 
@@ -1060,8 +1166,9 @@ sig = HMAC-SHA256(clusterSecret, canonical)
 ### 阶段二：集群成员与元数据
 - [ ] `node` / `replica` / `asset_access` 表（§8）
 - [ ] `GET /api/cluster/state`（按需拉取）；可选轻量存活上报（§9.1）
+- [ ] **目录放置图跨节点共享**：`directory` 经 `/state` 拉取聚合（`AggregateDirectoryStats` LWW）+ 持久化到本机库（控制面共享，§8.6.5）
 - [ ] Coordinator 选举（§10）
-- [ ] 验收：关掉当前 Coordinator，另一在线节点在 `COORD_TIMEOUT` 内自动当选并接管决策；`clusterSecret` 握手下发成功、HMAC 验签通过（§9.5）
+- [ ] 验收：关掉当前 Coordinator，另一在线节点在 `COORD_TIMEOUT` 内自动当选并接管决策；`clusterSecret` 握手下发成功、HMAC 验签通过（§9.5）；**任一节点离线后，其余节点的 `directory_global` 仍含其目录放置记录，Coordinator 能正确决策重宿主**
 
 ### 阶段三：副本保证（R3，最高优先业务价值）
 - [ ] 副本健康检查（§7.2）
@@ -1160,3 +1267,4 @@ type DirManifest  struct { DirKey string; Files []FileEntry; Checksum string } /
 - 最终一致性下，副本数短时间可能不足（补副本有延迟）。
 - 局域网带宽有限，大规模迁移需较长时间。
 - 本设计聚焦局域网；跨公网 P2P 不在此范围。
+- 元数据可见性已按 §8.6 分层：**目录放置图（控制面）跨节点复制**，消除了"节点离线后无人知道该均衡"的盲点；但文件级 `replica` 仍本机持有，纯在线修复在 B、C 离线且盘未认领前受限，需配合 §11.3 认领 + `.immich-dir.json` 重建兜底。

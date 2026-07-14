@@ -20,10 +20,11 @@ import (
 // StatePayload 对应 §9.1 集群状态拉取响应；Signature 由 SignPayload 计算（§9.5）。
 // SignedAt 为签名时刻的 epoch 秒，客户端据此重建签名并校验（§9.5 防篡改）。
 type StatePayload struct {
-	NodeID    string      `json:"nodeId"`
-	Disks     []DiskState `json:"disks"`
-	SignedAt  int64       `json:"signedAt,omitempty"`
-	Signature string      `json:"signature,omitempty"`
+	NodeID     string          `json:"nodeId"`
+	Disks      []DiskState     `json:"disks"`
+	Directories []DirectoryDTO `json:"directories"`
+	SignedAt   int64           `json:"signedAt,omitempty"`
+	Signature  string          `json:"signature,omitempty"`
 }
 
 // DiskState 状态 payload 中的单盘视图。
@@ -46,8 +47,8 @@ type Task struct {
 	Status  string `json:"status,omitempty"` // QUEUED | RUNNING | DONE | FAILED
 }
 
-// DirectoryDTO 目录聚合元数据的线上传输结构（§9.x 目录跨节点重宿主）：
-// 目标节点在本地无目录记录时从源节点拉取，领养为权威记录。
+// DirectoryDTO 目录聚合元数据的线上传输结构（§8.6 控制面放置图）：
+// 随 /state 上报，对端拉取后按 lastEvalAt 做 LWW 合并。
 type DirectoryDTO struct {
 	DirKey      string  `json:"dirKey"`
 	NodeID      string  `json:"nodeId"`
@@ -56,6 +57,7 @@ type DirectoryDTO struct {
 	Temperature float64 `json:"temperature"`
 	TotalBytes  int64   `json:"totalBytes"`
 	AccessScore float64 `json:"accessScore"`
+	LastEvalAt  int64   `json:"lastEvalAt,omitempty"`
 }
 
 // ToModel 转为领域模型。
@@ -68,6 +70,7 @@ func (d DirectoryDTO) ToModel() model.Directory {
 		Temperature: d.Temperature,
 		TotalBytes:  d.TotalBytes,
 		AccessScore: d.AccessScore,
+		LastEvalAt:  d.LastEvalAt,
 	}
 }
 
@@ -81,6 +84,7 @@ func DirectoryFromModel(d model.Directory) DirectoryDTO {
 		Temperature: d.Temperature,
 		TotalBytes:  d.TotalBytes,
 		AccessScore: d.AccessScore,
+		LastEvalAt:  d.LastEvalAt,
 	}
 }
 

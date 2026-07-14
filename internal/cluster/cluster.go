@@ -34,6 +34,24 @@ func AggregateDiskStats(reports []model.Node) map[string]model.Disk {
 	return merged
 }
 
+// AggregateDirectoryStats 全局目录放置图只读聚合（§8.6 控制面）：
+// 同一 dir_key 被多个来源上报时，取 last_eval_at 较大者（更新者胜）；
+// 时间戳相同则取 nodeId 字典序较大者以保证确定性。结果只存在于调用方内存，
+// 由调用方（Node.Federate）持久化进本地库，使单节点下线后记录仍保留。
+func AggregateDirectoryStats(reports []model.Node) map[string]model.Directory {
+	merged := map[string]model.Directory{}
+	for _, n := range reports {
+		for _, d := range n.Directories {
+			cur, ok := merged[d.DirKey]
+			if !ok || d.LastEvalAt > cur.LastEvalAt ||
+				(d.LastEvalAt == cur.LastEvalAt && d.NodeID > cur.NodeID) {
+				merged[d.DirKey] = d
+			}
+		}
+	}
+	return merged
+}
+
 // ElectCoordinator 选举协调者（§10）：最高 onlineScore 优先，平票取 nodeId 最小者。
 func ElectCoordinator(nodes []model.Node) string {
 	best := ""
