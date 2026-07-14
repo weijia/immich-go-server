@@ -28,6 +28,9 @@ func main() {
 	discover := envOr("DISCOVER_ADDR", "") // 例：239.0.0.1:9999
 	diskDirs := splitList(envOr("DISK_DIRS", ""))
 	claimGrace := int64(envOrInt("CLAIM_GRACE_SEC", 3600))
+	serverName := envOr("SERVER_NAME", "immich-go-server")
+	serverURL := envOr("SERVER_URL", "")
+	clientDiscover := envOr("CLIENT_DISCOVER_ADDR", ":2284") // 空则禁用客户端发现
 
 	base := server.Config{
 		NodeID:   nodeID,
@@ -36,6 +39,9 @@ func main() {
 		BlobRoot:  blobRoot,
 		DBPath:    dbPath,
 		DiscoverAddr: discover,
+		ServerName: serverName,
+		ServerURL: serverURL,
+		ClientDiscoverAddr: clientDiscover,
 	}
 	if len(diskDirs) > 0 {
 		base.OnTick = makeTick(nodeID, diskDirs, claimGrace)
@@ -67,7 +73,7 @@ func main() {
 			time.Sleep(10 * time.Millisecond)
 		}
 	}
-	log.Printf("immich-go-server node %q listening on %s (discovery=%q)", nodeID, addr, discover)
+	log.Printf("immich-go-server node %q listening on %s (cluster-discovery=%q, client-discovery-udp=%s)", nodeID, addr, discover, clientDiscover)
 	<-ctx.Done()
 	log.Println("shutting down")
 }

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/weijia/immich-go-server/internal/cluster"
@@ -26,10 +27,15 @@ type Config struct {
 	DBPath    string
 	MaxSkew  int64 // HMAC 时间窗，默认 300
 
-	DiscoverAddr     string        // UDP 发现地址（如 "239.0.0.1:9999"），空则禁用
+	DiscoverAddr     string        // 节点间 UDP 发现地址（如 "239.0.0.1:9999"），空则禁用
 	DiscoverInterval time.Duration // 默认 5s
 	TickInterval     time.Duration // 默认 15s；每次触发 OnTick
 	OnTick           func(ctx context.Context, n *Node)
+
+	// 面向 Immich 客户端的发现与展示
+	ServerName         string // 发现响应中的展示名，默认 "immich-go-server"
+	ServerURL          string // 外部可达基址（如 http://192.168.1.5:8081），空则自动推导
+	ClientDiscoverAddr string // 客户端 UDP 发现监听地址，默认 ":2284"，空则禁用
 }
 
 // Node 单节点运行实例。
@@ -44,6 +50,9 @@ type Node struct {
 	lis      *discovery.Listener
 	discConn discovery.PacketConn
 	discDst  net.Addr
+
+	identity         discovery.ClientIdentity
+	clientResponder  *discovery.ClientResponder
 }
 
 // New 构造节点（打开 SQLite、装配 API 与发现）。
@@ -66,7 +75,23 @@ func New(cfg Config) (*Node, error) {
 		h.Source = clusterapi.FileSystemBlobSource{Root: cfg.BlobRoot}
 	}
 	h.BlobRoot = cfg.BlobRoot // 回退：Provider.DiskRoot() 查不到时用此单根
+	h.AssetStore = st         // 客户端媒体 API 后端（§media-api）
 	n := &Node{cfg: cfg, store: st, api: h, reg: discovery.NewRegistry()}
+
+	// 生成/复用服务器身份（serverId / serverToken / serverName），供客户端发现与认证引导。
+	ident, err := discovery.GenerateServerIdentity(
+		func(k string) (string, bool, error) { return st.GetServerConfig(k) },
+		func(k, v string) error { return st.SetServerConfig(k, v) },
+		cfg.ServerName,
+	)
+	if err != nil {
+		_ = st.Close()
+		return nil, fmt.Errorf("server identity: %w", err)
+	}
+	n.identity = ident
+	h.ServerID = ident.ServerID
+	h.ServerName = ident.ServerName
+	h.ServerToken = ident.ServerToken
 
 	if cfg.DiscoverAddr != "" {
 		ua, err := net.ResolveUDPAddr("udp", cfg.DiscoverAddr)
@@ -98,6 +123,18 @@ func (n *Node) Run(ctx context.Context) error {
 	if n.bc != nil {
 		n.bc.SetAddr(ln.Addr().String())
 	}
+	// 计算外部可达基址并启动面向客户端的 UDP 发现响应（§ discovery-protocol）。
+	extURL := n.externalURL()
+	n.api.ServerURL = extURL
+	if n.cfg.ClientDiscoverAddr != "" {
+		cr, cerr := discovery.NewClientResponder(n.cfg.ClientDiscoverAddr, n.identity, extURL)
+		if cerr != nil {
+			fmt.Printf("warn: client discovery disabled: %v\n", cerr)
+		} else {
+			n.clientResponder = cr
+			go func() { _ = cr.Run(ctx) }()
+		}
+	}
 	n.server = &http.Server{Handler: n.api.Mux()}
 	go func() { _ = n.server.Serve(ln) }()
 
@@ -113,6 +150,9 @@ func (n *Node) Run(ctx context.Context) error {
 	_ = n.server.Close()
 	if n.discConn != nil {
 		_ = n.discConn.Close()
+	}
+	if n.clientResponder != nil {
+		_ = n.clientResponder.Close()
 	}
 	return nil
 }
@@ -136,6 +176,77 @@ func (n *Node) Addr() string {
 		return ""
 	}
 	return n.listener.Addr().String()
+}
+
+// externalURL 返回客户端可达的基址（不含 /api），用于发现响应与 API 自述。
+// 若显式配置了 ServerURL 则直接用；否则从监听地址推导，并把回环/未指定地址替换为
+// 本机首个非回环 IPv4，确保局域网客户端能真正连上。
+func (n *Node) externalURL() string {
+	if n.cfg.ServerURL != "" {
+		return strings.TrimRight(n.cfg.ServerURL, "/")
+	}
+	host := listenHost(n.cfg.ListenAddr)
+	if isLoopbackOrUnspecified(host) {
+		if ip := firstNonLoopbackIP(); ip != "" {
+			host = ip
+		}
+	}
+	port := listenPort(n.listener.Addr().String())
+	return fmt.Sprintf("http://%s:%s", host, port)
+}
+
+func listenHost(addr string) string {
+	if i := strings.LastIndex(addr, ":"); i >= 0 {
+		return addr[:i]
+	}
+	return addr
+}
+
+func listenPort(addr string) string {
+	if i := strings.LastIndex(addr, ":"); i >= 0 {
+		return addr[i+1:]
+	}
+	return ""
+}
+
+func isLoopbackOrUnspecified(host string) bool {
+	if host == "" || host == "0.0.0.0" || host == "::" || host == "localhost" {
+		return true
+	}
+	return strings.HasPrefix(host, "127.") || strings.HasPrefix(host, "::1")
+}
+
+// firstNonLoopbackIP 返回本机首个 up 的非回环 IPv4 地址。
+func firstNonLoopbackIP() string {
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return ""
+	}
+	for _, iface := range ifaces {
+		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, a := range addrs {
+			var ip net.IP
+			switch v := a.(type) {
+			case *net.IPNet:
+				ip = v.IP
+			case *net.IPAddr:
+				ip = v.IP
+			}
+			if ip == nil || ip.IsLoopback() {
+				continue
+			}
+			if v4 := ip.To4(); v4 != nil {
+				return v4.String()
+			}
+		}
+	}
+	return ""
 }
 
 // Store 暴露本地仓储（供 OnTick / 测试使用）。
@@ -243,4 +354,9 @@ func (n *Node) Worker(gv cluster.GlobalView) *worker.Worker {
 }
 
 // Close 释放资源（停止 Run 后调用）。
-func (n *Node) Close() error { return n.store.Close() }
+func (n *Node) Close() error {
+	if n.clientResponder != nil {
+		_ = n.clientResponder.Close()
+	}
+	return n.store.Close()
+}

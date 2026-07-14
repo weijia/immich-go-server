@@ -2,10 +2,13 @@ package clusterapi
 
 import (
 	"bytes"
+	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
+	"mime"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -15,6 +18,7 @@ import (
 	"time"
 
 	"github.com/weijia/immich-go-server/internal/crypto"
+	"github.com/weijia/immich-go-server/internal/ingest"
 	"github.com/weijia/immich-go-server/internal/model"
 )
 
@@ -111,6 +115,78 @@ type BlobSource interface {
 	OpenBlob(assetID string, offset int64) (io.ReadCloser, error)
 }
 
+// AssetBackend 客户端媒体 API 的后端数据来源（§media-api）。*Store 实现该接口。
+type AssetBackend interface {
+	// GetAsset 读取单个资产（物理定位用 dir_key / checksum）。
+	GetAsset(assetID string) (model.Asset, bool, error)
+	// GetAssetMeta 读取资产 API 元信息；不存在返回 ok=false。
+	GetAssetMeta(assetID string) (model.AssetMeta, bool, error)
+	// ListAssets 返回全部资产（时间线列表）。
+	ListAssets() ([]model.Asset, error)
+	// SaveUploadedAsset 记录一次上传产物（asset + 副本 + 目录 + 元信息）。
+	SaveUploadedAsset(a model.Asset, diskSerial string, sizeBytes int64) error
+	// SaveAssetMeta 写入/覆盖资产 API 元信息。
+	SaveAssetMeta(m model.AssetMeta) error
+	// SaveDeviceAsset 记录 (deviceId, deviceAssetId) -> assetId 映射（去重）。
+	SaveDeviceAsset(deviceID, deviceAssetID, assetID string) error
+	// LookupDeviceAssets 返回该设备下已存在的 {deviceAssetId: assetId}。
+	LookupDeviceAssets(deviceID string, deviceAssetIDs []string) (map[string]string, error)
+	// DeleteAsset 删除资产全部元数据，返回被删资产（用于清理物理字节）。
+	DeleteAsset(assetID string) (model.Asset, bool, error)
+	// ListMountedDisks 返回本节点已认领、非可疑磁盘（按 free_bytes 降序）。
+	ListMountedDisks(nodeID string) ([]model.Disk, error)
+	// ListReplicas 返回某资产的所有副本（删除时定位物理仓库根）。
+	ListReplicas(assetID string) ([]model.Replica, error)
+	// DiskRoot 返回磁盘物理仓库根（blob_root），未知返回 ok=false。
+	DiskRoot(diskSerial string) (string, bool)
+}
+
+// AssetResponse 客户端资产响应（兼容 Immich AssetResponse 字段子集）。
+type AssetResponse struct {
+	ID             string `json:"id"`
+	OwnerID        string `json:"ownerId"`
+	DeviceAssetID  string `json:"deviceAssetId"`
+	DeviceID       string `json:"deviceId"`
+	Type           string `json:"type"`
+	OriginalPath   string `json:"originalPath"`
+	Thumbhash      string `json:"thumbhash,omitempty"`
+	FileCreatedAt  string `json:"fileCreatedAt"`
+	FileModifiedAt string `json:"fileModifiedAt"`
+	CreatedAt      string `json:"createdAt"`
+	UpdatedAt      string `json:"updatedAt"`
+	IsFavorite     bool   `json:"isFavorite"`
+	IsArchived     bool   `json:"isArchived"`
+	IsTrashed      bool   `json:"isTrashed"`
+	OriginalFileName string `json:"originalFileName"`
+	MimeType       string `json:"mimeType"`
+	FileSize       int64  `json:"fileSize"`
+	Width          int    `json:"width,omitempty"`
+	Height         int    `json:"height,omitempty"`
+	Duration       string `json:"duration,omitempty"`
+	Checksum       string `json:"checksum,omitempty"`
+	LivePhotoVideoID string `json:"livePhotoVideoId,omitempty"`
+}
+
+// AssetUploadResponse 上传响应（兼容 Immich）。
+type AssetUploadResponse struct {
+	ID        string `json:"id"`
+	Duplicate bool   `json:"duplicate"`
+}
+
+// BulkUploadCheckRequest / Response 客户端上传前批量查重。
+type BulkUploadCheckRequest struct {
+	DeviceAssetIDs []string `json:"deviceAssetIds"`
+	DeviceID       string   `json:"deviceId"`
+}
+type BulkUploadCheckResponse struct {
+	Results []AssetExistence `json:"results"`
+}
+type AssetExistence struct {
+	ID            string `json:"id"`
+	DeviceAssetID string `json:"deviceAssetId"`
+	Exists        bool   `json:"exists"`
+}
+
 // Handler 持有节点身份、共享密钥与后端 provider，注册带 HMAC 鉴权的路由。
 type Handler struct {
 	NodeID   string
@@ -120,6 +196,15 @@ type Handler struct {
 	Provider StateProvider
 	Source   BlobSource // 可选：提供 blob 拉取（§9.1），无 disk/dir 查询参数时作为回退
 	BlobRoot string     // 回退：单根 blob 目录，仅在 Provider.DiskRoot() 查不到时使用
+
+	// Immich 客户端 API（发现/认证引导）所需身份；ServerURL 由 server 在 Run 时填充。
+	ServerID    string
+	ServerName  string
+	ServerToken string
+	ServerURL   string // 外部可达基址（不含 /api，运行时填充）
+
+	// AssetStore 客户端媒体 API 后端（§media-api）；为 nil 时资产路由返回 501。
+	AssetStore AssetBackend
 
 	mu   sync.Mutex
 	seen map[string]bool
@@ -164,6 +249,22 @@ func (h *Handler) Mux() *http.ServeMux {
 	m.HandleFunc("/api/cluster/directory/release", h.auth(h.handleReleaseSource))
 	m.HandleFunc("/api/cluster/directory/", h.auth(h.handleGetDirectory))
 	m.HandleFunc("/api/cluster/blob/", h.auth(h.handleBlob))
+
+	// ---- Immich 客户端 API（发现/认证引导），不经集群 HMAC 鉴权 ----
+	// 客户端 openapi 生成的 pingServer() 请求 /api/server/ping，
+	// 这里同时注册新路径与遗留的 /api/server-info/ping（与 immich-android-server 保持一致）。
+	m.HandleFunc("/api/server/ping", h.handlePing)
+	m.HandleFunc("/api/server-info/ping", h.handlePing)
+	m.HandleFunc("/api/server-info", h.handleServerInfo)
+	m.HandleFunc("/api/auth/login", h.handleLogin)
+	m.HandleFunc("/api/auth/token-exchange", h.handleTokenExchange)
+	m.HandleFunc("/api/users/me/preferences", h.handleGetMyPreferences)
+	m.HandleFunc("/api/users/me", h.handleGetMe)
+
+	// ---- Immich 客户端媒体 API（资产上传/列表/下载/删除），不经集群 HMAC 鉴权 ----
+	m.HandleFunc("/api/assets/bulk-upload-check", h.handleBulkUploadCheck)
+	m.HandleFunc("/api/assets", h.handleAssets) // GET 列表 / POST 上传
+	m.HandleFunc("/api/assets/", h.handleAssetItem) // {id} / {id}/original / {id}/thumbnail
 	return m
 }
 
@@ -195,6 +296,538 @@ func (h *Handler) auth(next http.HandlerFunc) http.HandlerFunc {
 		}
 		next(w, r)
 	}
+}
+
+// ---- Immich 客户端 API（发现/认证引导） ----
+
+// handlePing 实现 Immich /api/server-info/ping（客户端连通性探测）。
+func (h *Handler) handlePing(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]string{"res": "pong"})
+}
+
+// handleServerInfo 实现 Immich /api/server-info（版本探测）。
+func (h *Handler) handleServerInfo(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"version": "3.0.0",
+		"build":   "immich-go-server",
+		"isNew":   false,
+	})
+}
+
+// handleLogin 实现 Immich /api/auth/login 的最小引导：返回 access token。
+func (h *Handler) handleLogin(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"accessToken": randomAccessToken(),
+		"userId":      h.ServerID,
+		"userEmail":   "admin@immich.local",
+		"name":        h.ServerName,
+		"isAdmin":     true,
+	})
+}
+
+// handleTokenExchange 实现 v3 发现引导：返回 serverToken + serverId，
+// 供客户端缓存后用于后续发现响应的签名校验（文档中为 HTTPS 首连交换）。
+func (h *Handler) handleTokenExchange(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"serverId":    h.ServerID,
+		"serverToken": h.ServerToken,
+		"expiresAt":   nil,
+	})
+}
+
+// handleGetMe 实现 Immich /api/users/me：返回当前（admin）用户，
+// 字段对齐 openapi UserAdminResponseDto 的全部必填项，供客户端 saveAuthInfo
+// 在登录后解析/恢复会话（否则会触发客户端回退逻辑）。
+func (h *Handler) handleGetMe(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	now := time.Now().UTC().Format(time.RFC3339)
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"id":                   h.ServerID,
+		"email":                "admin@immich.local",
+		"name":                 h.ServerName,
+		"isAdmin":              true,
+		"avatarColor":          "primary",
+		"createdAt":            now,
+		"updatedAt":            now,
+		"profileChangedAt":     now,
+		"deletedAt":            nil,
+		"license":              nil,
+		"oauthId":              "",
+		"profileImagePath":     "",
+		"quotaSizeInBytes":     nil,
+		"quotaUsageInBytes":    nil,
+		"shouldChangePassword": false,
+		"status":               "active",
+		"storageLabel":         nil,
+	})
+}
+
+// handleGetMyPreferences 实现 Immich /api/users/me/preferences：返回默认用户偏好，
+// 字段对齐 openapi UserPreferencesResponseDto 的全部必填嵌套对象。
+// getMyUser() 会以 (.wait) 并行请求本接口与 /users/me，任一失败即导致会话建立失败。
+func (h *Handler) handleGetMyPreferences(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"albums": map[string]any{
+			"defaultAssetOrder": "asc",
+		},
+		"cast": map[string]any{
+			"gCastEnabled": false,
+		},
+		"download": map[string]any{
+			"archiveSize":          -1,
+			"includeEmbeddedVideos": false,
+		},
+		"emailNotifications": map[string]any{
+			"albumInvite": false,
+			"albumUpdate": false,
+			"enabled":     false,
+		},
+		"folders": map[string]any{
+			"enabled":    false,
+			"sidebarWeb": false,
+		},
+		"memories": map[string]any{
+			"duration": 0,
+			"enabled":  false,
+		},
+		"people": map[string]any{
+			"enabled":    false,
+			"sidebarWeb": false,
+		},
+		"purchase": map[string]any{
+			"hideBuyButtonUntil": "",
+			"showSupportBadge":   false,
+		},
+		"ratings": map[string]any{
+			"enabled": false,
+		},
+		"sharedLinks": map[string]any{
+			"enabled":    false,
+			"sidebarWeb": false,
+		},
+		"tags": map[string]any{
+			"enabled":    false,
+			"sidebarWeb": false,
+		},
+	})
+}
+
+// ---- Immich 客户端媒体 API（§media-api） ----
+
+func (h *Handler) assetUnavailable(w http.ResponseWriter) {
+	http.Error(w, "asset api not configured", http.StatusNotImplemented)
+}
+
+func (h *Handler) handleBulkUploadCheck(w http.ResponseWriter, r *http.Request) {
+	if h.AssetStore == nil {
+		h.assetUnavailable(w)
+		return
+	}
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req BulkUploadCheckRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	exists := map[string]string{}
+	if req.DeviceID != "" && len(req.DeviceAssetIDs) > 0 {
+		m, err := h.AssetStore.LookupDeviceAssets(req.DeviceID, req.DeviceAssetIDs)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		exists = m
+	}
+	resp := BulkUploadCheckResponse{Results: make([]AssetExistence, 0, len(req.DeviceAssetIDs))}
+	for _, daid := range req.DeviceAssetIDs {
+		if id, ok := exists[daid]; ok {
+			resp.Results = append(resp.Results, AssetExistence{ID: id, DeviceAssetID: daid, Exists: true})
+		} else {
+			resp.Results = append(resp.Results, AssetExistence{ID: "", DeviceAssetID: daid, Exists: false})
+		}
+	}
+	writeJSON(w, resp)
+}
+
+// handleAssets GET 列表 / POST 上传。
+func (h *Handler) handleAssets(w http.ResponseWriter, r *http.Request) {
+	if h.AssetStore == nil {
+		h.assetUnavailable(w)
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		h.listAssets(w, r)
+	case http.MethodPost:
+		h.uploadAsset(w, r)
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func (h *Handler) listAssets(w http.ResponseWriter, r *http.Request) {
+	assets, err := h.AssetStore.ListAssets()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	out := make([]AssetResponse, 0, len(assets))
+	for _, a := range assets {
+		out = append(out, h.buildAssetResponse(a))
+	}
+	writeJSON(w, out)
+}
+
+func (h *Handler) uploadAsset(w http.ResponseWriter, r *http.Request) {
+	if err := r.ParseMultipartForm(64 << 20); err != nil {
+		http.Error(w, "bad request: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	fh := r.MultipartForm.File["assetData"]
+	if len(fh) == 0 {
+		http.Error(w, "missing assetData", http.StatusBadRequest)
+		return
+	}
+	deviceAssetID := formStr(r, "deviceAssetId")
+	deviceID := formStr(r, "deviceId")
+	fileCreatedAt := formStr(r, "fileCreatedAt")
+	fileModifiedAt := formStr(r, "fileModifiedAt")
+	isFavorite := formStr(r, "isFavorite") == "true"
+	duration := formStr(r, "duration")
+
+	// 去重：相同 (deviceId, deviceAssetId) 已存在则直接返回既有 id。
+	if deviceID != "" && deviceAssetID != "" {
+		if m, err := h.AssetStore.LookupDeviceAssets(deviceID, []string{deviceAssetID}); err == nil {
+			if id, ok := m[deviceAssetID]; ok {
+				writeJSONStatus(w, AssetUploadResponse{ID: id, Duplicate: true}, http.StatusOK)
+				return
+			}
+		}
+	}
+
+	f := fh[0]
+	src, err := f.Open()
+	if err != nil {
+		http.Error(w, "open upload: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	defer src.Close()
+	data, err := io.ReadAll(src)
+	if err != nil {
+		http.Error(w, "read upload: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	sum := sha256.Sum256(data)
+	assetID := hex.EncodeToString(sum[:])
+	size := int64(len(data))
+
+	// 选盘：本节点 free_bytes 最大的已认领盘；无则回退单根 BlobRoot。
+	diskSerial := ""
+	blobRoot := h.BlobRoot
+	if disks, err := h.AssetStore.ListMountedDisks(h.NodeID); err == nil && len(disks) > 0 {
+		diskSerial = disks[0].DiskSerial
+		if root, ok := h.AssetStore.DiskRoot(diskSerial); ok {
+			blobRoot = root
+		}
+	}
+	if blobRoot == "" {
+		http.Error(w, "no storage configured (set BLOB_ROOT or DISK_DIRS)", http.StatusInternalServerError)
+		return
+	}
+
+	// dir_key 由拍摄/修改时间推导，失败回退当前时间。
+	t := time.Now()
+	if s := fileCreatedAt; s != "" {
+		if pt, err := time.Parse(time.RFC3339, s); err == nil {
+			t = pt
+		} else if pt, err := time.Parse(time.RFC3339, fileModifiedAt); err == nil {
+			t = pt
+		}
+	}
+	dirKey := t.Format("2006/01")
+
+	// 写物理字节 + sidecar（仓库即真相）。
+	destDir := filepath.Join(blobRoot, filepath.FromSlash(dirKey))
+	dest := filepath.Join(destDir, assetID)
+	if err := os.MkdirAll(destDir, 0o755); err != nil {
+		http.Error(w, "mkdir: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if err := os.WriteFile(dest, data, 0o644); err != nil {
+		http.Error(w, "write: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	ext := strings.ToLower(filepath.Ext(f.Filename))
+	mimeType := mime.TypeByExtension(ext)
+	if mimeType == "" {
+		mimeType = "application/octet-stream"
+	}
+	kind := "other"
+	assetType := "IMAGE"
+	switch {
+	case strings.HasPrefix(mimeType, "image/"):
+		kind, assetType = "photo", "IMAGE"
+	case strings.HasPrefix(mimeType, "video/"):
+		kind, assetType = "video", "VIDEO"
+	}
+	if err := ingest.FlushMeta(blobRoot, dirKey, []ingest.MetaAsset{{
+		AssetID:      assetID,
+		Checksum:     assetID,
+		SizeBytes:    size,
+		OriginalPath: f.Filename,
+		CapturedAt:   t.Format(time.RFC3339),
+		Kind:         kind,
+	}}); err != nil {
+		http.Error(w, "meta: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// 写元数据。
+	asset := model.Asset{AssetID: assetID, SizeBytes: size, Checksum: assetID, DirKey: dirKey, OriginalPath: f.Filename}
+	if err := h.AssetStore.SaveUploadedAsset(asset, diskSerial, size); err != nil {
+		http.Error(w, "store: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	meta := model.AssetMeta{
+		AssetID:          assetID,
+		DeviceAssetID:    deviceAssetID,
+		DeviceID:         deviceID,
+		FileCreatedAt:    fileCreatedAt,
+		FileModifiedAt:   fileModifiedAt,
+		IsFavorite:       isFavorite,
+		Duration:         duration,
+		Type:             assetType,
+		MimeType:         mimeType,
+		OriginalFileName: f.Filename,
+	}
+	if err := h.AssetStore.SaveAssetMeta(meta); err != nil {
+		http.Error(w, "store meta: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if deviceID != "" && deviceAssetID != "" {
+		_ = h.AssetStore.SaveDeviceAsset(deviceID, deviceAssetID, assetID)
+	}
+
+	writeJSONStatus(w, AssetUploadResponse{ID: assetID, Duplicate: false}, http.StatusCreated)
+}
+
+// handleAssetItem 处理 /api/assets/{id} 及其子资源（/original /thumbnail）与 DELETE。
+func (h *Handler) handleAssetItem(w http.ResponseWriter, r *http.Request) {
+	if h.AssetStore == nil {
+		h.assetUnavailable(w)
+		return
+	}
+	rest := strings.TrimPrefix(r.URL.Path, "/api/assets/")
+	parts := strings.SplitN(rest, "/", 2)
+	id := parts[0]
+	if id == "" {
+		http.Error(w, "missing asset id", http.StatusBadRequest)
+		return
+	}
+	sub := ""
+	if len(parts) > 1 {
+		sub = parts[1]
+	}
+
+	switch r.Method {
+	case http.MethodDelete:
+		h.deleteAsset(w, r, id)
+		return
+	case http.MethodGet:
+		// ok
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	switch sub {
+	case "":
+		a, ok, err := h.AssetStore.GetAsset(id)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if !ok {
+			http.Error(w, "asset not found", http.StatusNotFound)
+			return
+		}
+		writeJSON(w, h.buildAssetResponse(a))
+	case "original", "thumbnail":
+		h.serveAssetBytes(w, r, id, sub)
+	default:
+		http.Error(w, "not found", http.StatusNotFound)
+	}
+}
+
+func (h *Handler) deleteAsset(w http.ResponseWriter, r *http.Request, id string) {
+	a, ok, err := h.AssetStore.GetAsset(id)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if !ok {
+		http.Error(w, "asset not found", http.StatusNotFound)
+		return
+	}
+	// 删除元数据前先定位物理仓库根（删除副本记录会丢失磁盘归属）。
+	blobRoot := h.BlobRoot
+	if reps, err := h.AssetStore.ListReplicas(id); err == nil && len(reps) > 0 {
+		if root, ok := h.AssetStore.DiskRoot(reps[0].DiskSerial); ok {
+			blobRoot = root
+		}
+	}
+	if _, _, err := h.AssetStore.DeleteAsset(id); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if blobRoot != "" {
+		_ = os.Remove(filepath.Join(blobRoot, filepath.FromSlash(a.DirKey), a.AssetID))
+		_ = ingest.RemoveAssetFromMeta(blobRoot, a.DirKey, a.AssetID)
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (h *Handler) serveAssetBytes(w http.ResponseWriter, r *http.Request, id, sub string) {
+	a, ok, err := h.AssetStore.GetAsset(id)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if !ok {
+		http.Error(w, "asset not found", http.StatusNotFound)
+		return
+	}
+	blobRoot := h.BlobRoot
+	if reps, err := h.AssetStore.ListReplicas(id); err == nil && len(reps) > 0 {
+		if root, ok := h.AssetStore.DiskRoot(reps[0].DiskSerial); ok {
+			blobRoot = root
+		}
+	}
+	if blobRoot == "" {
+		http.Error(w, "no storage configured", http.StatusInternalServerError)
+		return
+	}
+	phys := filepath.Join(blobRoot, filepath.FromSlash(a.DirKey), a.AssetID)
+	f, err := os.Open(phys)
+	if err != nil {
+		http.Error(w, "asset not found", http.StatusNotFound)
+		return
+	}
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil {
+		http.Error(w, "stat failed", http.StatusInternalServerError)
+		return
+	}
+	ext := strings.ToLower(filepath.Ext(a.OriginalPath))
+	if ext == "" {
+		ext = strings.ToLower(filepath.Ext(a.AssetID))
+	}
+	ct := mime.TypeByExtension(ext)
+	if ct == "" {
+		ct = "application/octet-stream"
+	}
+	if sub == "thumbnail" && !strings.HasPrefix(ct, "image/") {
+		ct = "image/jpeg"
+	}
+	w.Header().Set("Content-Type", ct)
+	w.Header().Set("Content-Length", strconv.FormatInt(fi.Size(), 10))
+	w.Header().Set("Accept-Ranges", "bytes")
+	io.Copy(w, f)
+}
+
+// buildAssetResponse 由资产 + 元信息拼出客户端响应。
+func (h *Handler) buildAssetResponse(a model.Asset) AssetResponse {
+	meta, _, _ := h.AssetStore.GetAssetMeta(a.AssetID)
+	now := time.Now().UTC().Format(time.RFC3339)
+	resp := AssetResponse{
+		ID:               a.AssetID,
+		OwnerID:          h.ServerID,
+		DeviceAssetID:    meta.DeviceAssetID,
+		DeviceID:         meta.DeviceID,
+		Type:             meta.Type,
+		OriginalPath:     a.OriginalPath,
+		FileCreatedAt:    meta.FileCreatedAt,
+		FileModifiedAt:   meta.FileModifiedAt,
+		CreatedAt:        now,
+		UpdatedAt:        now,
+		IsFavorite:       meta.IsFavorite,
+		IsArchived:       false,
+		IsTrashed:        false,
+		OriginalFileName: meta.OriginalFileName,
+		MimeType:         meta.MimeType,
+		FileSize:         a.SizeBytes,
+		Width:            meta.Width,
+		Height:           meta.Height,
+		Duration:         meta.Duration,
+		Checksum:         a.Checksum,
+	}
+	if resp.Type == "" {
+		resp.Type = "IMAGE"
+	}
+	return resp
+}
+
+func formStr(r *http.Request, key string) string {
+	if r.MultipartForm == nil {
+		return ""
+	}
+	vs := r.MultipartForm.Value[key]
+	if len(vs) == 0 {
+		return ""
+	}
+	return vs[0]
+}
+
+func writeJSON(w http.ResponseWriter, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(v)
+}
+
+func writeJSONStatus(w http.ResponseWriter, v any, status int) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(v)
+}
+
+func randomAccessToken() string {
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		return ""
+	}
+	return hex.EncodeToString(b)
 }
 
 func (h *Handler) handleState(w http.ResponseWriter, r *http.Request) {

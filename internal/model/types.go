@@ -68,3 +68,21 @@ type Directory struct {
 	AccessScore  float64
 	LastEvalAt   int64 // 最近一次评估/变更时刻（epoch 秒），用于跨节点 LWW 合并
 }
+
+// AssetMeta 资产在客户端 API 响应中所需的展示字段。
+// 仓库物理真相（.meta.json）只存 checksum/size/kind；这里存展示层字段，
+// 与物理层解耦（§media-api）。
+type AssetMeta struct {
+	AssetID          string
+	DeviceAssetID    string
+	DeviceID         string
+	FileCreatedAt    string
+	FileModifiedAt   string
+	IsFavorite       bool
+	Duration         string
+	Type             string // IMAGE | VIDEO
+	MimeType         string
+	OriginalFileName string
+	Width            int
+	Height           int
+}

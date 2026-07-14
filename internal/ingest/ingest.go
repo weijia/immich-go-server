@@ -175,15 +175,16 @@ func (g *Ingester) Run(ctx context.Context, srcRoot, blobRoot, mode string) (*Re
 
 	// flush sidecar 分片（合并既有，按 asset_id 去重）
 	for dirKey, assets := range pending {
-		if err := flushMeta(blobRoot, dirKey, assets); err != nil {
+		if err := FlushMeta(blobRoot, dirKey, assets); err != nil {
 			rep.Errors++
 		}
 	}
 	return rep, nil
 }
 
-// flushMeta 把本批资产合并进 blobRoot/<dir_key>/.meta.json（保留既有，按 asset_id 去重）。
-func flushMeta(blobRoot, dirKey string, assets []MetaAsset) error {
+// FlushMeta 把本批资产合并进 blobRoot/<dir_key>/.meta.json（保留既有，按 asset_id 去重）。
+// 导出供上传接口复用，保证"上传"与"ingest 摄入"产物格式一致。
+func FlushMeta(blobRoot, dirKey string, assets []MetaAsset) error {
 	p := metaPath(blobRoot, dirKey)
 	var existing MetaFile
 	if b, err := os.ReadFile(p); err == nil {
@@ -213,6 +214,38 @@ func flushMeta(blobRoot, dirKey string, assets []MetaAsset) error {
 
 func metaPath(blobRoot, dirKey string) string {
 	return filepath.Join(blobRoot, filepath.FromSlash(dirKey), ".meta.json")
+}
+
+// RemoveAssetFromMeta 从 blobRoot/<dir_key>/.meta.json 中移除单个 asset_id 记录；
+// 若分片清空则删除 .meta.json。供资产删除时同步仓库真相。
+func RemoveAssetFromMeta(blobRoot, dirKey, assetID string) error {
+	p := metaPath(blobRoot, dirKey)
+	b, err := os.ReadFile(p)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	var mf MetaFile
+	if err := json.Unmarshal(b, &mf); err != nil {
+		return err
+	}
+	kept := mf.Assets[:0]
+	for _, a := range mf.Assets {
+		if a.AssetID != assetID {
+			kept = append(kept, a)
+		}
+	}
+	mf.Assets = kept
+	if len(mf.Assets) == 0 {
+		return os.Remove(p)
+	}
+	data, err := json.MarshalIndent(mf, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(p, data, 0o644)
 }
 
 func checksumFile(path string) (string, int64, error) {
