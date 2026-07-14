@@ -374,6 +374,52 @@ Coordinator                 SourceNode              TargetNode
 - 传输带校验和（复用 `asset.checksum`，为空则迁移时计算并回填）。
 - 目录级原子性：以目录为回滚单位，避免"迁了一半"。
 
+### 6.5.1 断点续传（大目录中途中断恢复）
+
+§6.5 的"整目录复制"对大月份目录（数千文件、数百 GB）是一次性操作；一旦中途掉线或低电量/移动网络暂停（§6.6），若从头重来会浪费带宽、违背节流初衷。需支持**断点续传**。
+
+**进度存哪（关键：Coordinator 无状态，§10）**：进度**不存 Coordinator**，而是落在**目标节点磁盘**上的临时清单 `.<dirKey>.migrating.json`（落于目标磁盘存储根）：
+
+```json
+{
+  "taskId": "mig-2026-06-a1b2",
+  "srcDisk": "WD-1234", "dstDisk": "SN-5678",
+  "totalFiles": 5000, "totalBytes": 256000000000,
+  "completed": ["asset-a1", "asset-a2"],
+  "partial":  { "asset-video-x": { "bytesCopied": 734003200 } },
+  "state": "IN_PROGRESS"
+}
+```
+
+**任务状态机**：`PLANNED → IN_PROGRESS → (COPIED → VERIFIED) → DONE`；异常 `ROLLBACK / FAILED`。
+
+**续传逻辑（目标节点自愈，Coordinator 仅按 `taskId` 重发）**：
+
+```
+目标节点读 .migrating.json 后恢复：
+  for f in 源目录文件:
+    if f in completed:        跳过（仅轻量重校验，确认本地未损坏）
+    elif f in partial:        发 Range: bytes=<bytesCopied>- 续传该文件尾部并追加
+    else:                     从头整文件拉取 + 逐文件 checksum 校验
+  全部文件完成 → 比对整目录 checksum(§11 .immich-dir.json) → 注册副本 → 通知 Coordinator
+```
+
+**两种"半成品"处理**：
+
+| 方式 | 适用 | 做法 |
+|------|------|------|
+| 整文件重拷（默认简单路径） | 文件不大 | partial 直接丢弃重来，靠 checksum 幂等 |
+| 字节级续传（大文件） | 单文件 GB 级（视频） | 源节点支持 `Range` 请求，目标 append；整体拷完再算最终 checksum |
+
+**与原子性/副本约束不冲突**：
+- 源删除**仍只在**全部文件 `completed` 且有效副本数 ≥2 后发生（沿用 §6.5 硬约束）。
+- partial 文件不计入副本数、不参加"副本达标"判定。
+- 同一 `taskId` 幂等：即使 Coordinator 漂移/脑裂换人（§10.4），重发任务也只续传、不重复全量拷。
+
+**失败收敛**：
+- 续传重试超 `MIGRATION_MAX_RETRY` → 任务 `FAILED`；Coordinator 可改派目标盘，源副本保留。
+- 低电量/移动网络暂停（§6.6）→ 仅暂停、**不断点**，恢复后从 `.migrating.json` 接着走。
+
 ### 6.6 迁移节流
 
 | 限制 | 目的 |
@@ -656,6 +702,45 @@ CREATE INDEX idx_directory_disk ON directory(disk_serial);
 - 该接口只读、幂等；返回的"当前可见归属"与 §4.3 聚合的 `mountedNodeId`（取最新上报者）保持一致。
 - 价值：磁盘跨节点拔插后，blob 访问能**自动改道到新节点**；同时把 Coordinator 从"每次路由必经"降级为兜底，减少单点依赖。
 
+### 9.5 集群 HMAC 鉴权细节
+
+所有 `/api/cluster/*` 请求须带节点间签名，防止局域网内伪造节点/篡改状态。鉴权基于**集群共享密钥**而非单节点 `serverToken`（后者是每台节点自己的，无法让 A 验证 B）。
+
+**密钥来源（clusterSecret）**：
+- 集群首次组建时，由最先成立的节点生成 256-bit 随机 `clusterSecret`，随 UDP 发现握手下发给每个加入节点（受信任局域网内明文下发，或手动配对码）。
+- 各节点本地持久化（keychain/加密存储），不当成全局元数据。
+- 节点脱群超 `OFFLINE_SUSPECT_DAYS` 再回来需重新走握手领密钥（可能已轮换）。
+
+**请求头（每个集群请求携带）**：
+
+```
+X-Cluster-NodeId:    550e8400-...        // 发送方节点
+X-Cluster-Timestamp: 1781050000         // epoch 秒，防重放
+X-Cluster-Nonce:     <随机16字节>         // 单次随机，防重放
+X-Cluster-Sig:       <HMAC>              // 签名值
+```
+
+**签名算法（HMAC-SHA256）**：
+
+```
+canonical = METHOD + "\n" + PATH + "\n" + TIMESTAMP + "\n" + NONCE + "\n" + SHA256(BODY)
+sig = HMAC-SHA256(clusterSecret, canonical)
+```
+
+- body 为 JSON 时先算 `SHA256(body)`，避免大 payload 重复序列化。
+- §9.1 状态 payload 的 `signature` 字段即：`HMAC(clusterSecret, nodeId + timestamp + SHA256(jsonPayload))`。
+
+**接收方验签（四道关）**：
+
+```
+1. 用本机 clusterSecret 对相同 canonical 重算 HMAC
+2. 常数时间比较 sig（防时序侧信道）
+3. 时间窗：|now - Timestamp| > MAX_CLOCK_SKEW(默认300s) → 拒
+4. 防重放：Nonce 在 skew 窗口内进已见集合，重复 Nonce → 拒
+```
+
+**密钥轮换**：`POST /api/cluster/key/rotate` 协商新密钥后进入重叠窗口（旧+新都接受），待所有节点拉到新密钥再废旧旧密钥。
+
 ---
 
 ## 10. Coordinator 选举
@@ -837,6 +922,8 @@ CREATE INDEX idx_directory_disk ON directory(disk_serial);
 | `MIGRATION_BYTES_PER_CYCLE` | 可配 | 每周期迁移配额（§6.4 收益排序上限） |
 | `TEMP_WEIGHTS` | 0.4/0.5/0.1 | 温度权重 w1/w2/w3 |
 | `OFFLINE_SUSPECT_DAYS` | 30 | 磁盘离线多久视为可疑/掉线降权 |
+| `MAX_CLOCK_SKEW` | 300s | HMAC 时间窗容差，超出拒绝（§9.5） |
+| `MIGRATION_MAX_RETRY` | 5 | 断点续传失败重试上限，超出任务 FAILED（§6.5.1） |
 
 ---
 
