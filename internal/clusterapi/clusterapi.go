@@ -40,6 +40,7 @@ type Task struct {
 	AssetID string `json:"assetId,omitempty"`
 	SrcDisk string `json:"srcDisk,omitempty"`
 	DstDisk string `json:"dstDisk,omitempty"`
+	Status  string `json:"status,omitempty"` // QUEUED | RUNNING | DONE | FAILED
 }
 
 // StateProvider 集群 API 的后端数据来源；实现可插拔（内存 / SQLite）。

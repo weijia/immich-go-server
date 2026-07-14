@@ -1,6 +1,7 @@
 package cluster
 
 import (
+	"bytes"
 	"context"
 	"crypto/hmac"
 	"encoding/json"
@@ -189,9 +190,14 @@ func nodeFromState(nodeID string, sp clusterapi.StatePayload) model.Node {
 
 // GlobalRepo 把全局聚合视图适配为 coordinator.Repository（§6 / §9.2）：
 // 磁盘来自跨节点合并视图；目录/资产/副本/任务下发仍走本节点本地存储。
+// SubmitTask 会把任务下发到 dstDisk 实际挂载的节点（本节点则本地落库），
+// 由该节点的 worker 以"拉模型"执行（源可来自任意节点，§6.5 / §9.1）。
 type GlobalRepo struct {
-	Disks map[string]model.Disk
-	Local coordinator.Repository
+	Disks   map[string]model.Disk
+	Local   coordinator.Repository
+	SelfID  string
+	PeerURL func(nodeID string) (string, bool) // 节点 ID → 基址（http://host:port）
+	Client  *Client
 }
 
 // ListDisks 返回聚合后的全局磁盘视图（跨节点）。
@@ -210,8 +216,52 @@ func (g *GlobalRepo) ListReplicas(a string) ([]model.Replica, error) {
 	return g.Local.ListReplicas(a)
 }
 func (g *GlobalRepo) ReplicaCount(a string) int { return g.Local.ReplicaCount(a) }
+
+// SubmitTask 路由任务到 dstDisk 所在节点（§9.2）：本节点则本地落库，对端则 HMAC POST。
 func (g *GlobalRepo) SubmitTask(t clusterapi.Task) error {
-	return g.Local.SubmitTask(t)
+	owner := ""
+	if d, ok := g.Disks[t.DstDisk]; ok {
+		owner = d.MountedNodeID
+	}
+	if owner == "" || owner == g.SelfID {
+		return g.Local.SubmitTask(t)
+	}
+	if g.PeerURL == nil || g.Client == nil {
+		return fmt.Errorf("no route to dst owner %s for disk %s", owner, t.DstDisk)
+	}
+	url, ok := g.PeerURL(owner)
+	if !ok {
+		return fmt.Errorf("unknown peer %s for disk %s", owner, t.DstDisk)
+	}
+	return g.Client.SubmitTask(context.Background(), url, t)
+}
+
+// SubmitTask 经 HMAC 鉴权 POST 一条任务到对端节点（§9.2）。
+func (c *Client) SubmitTask(ctx context.Context, baseURL string, task clusterapi.Task) error {
+	path := "/api/cluster/task"
+	body, err := json.Marshal(task)
+	if err != nil {
+		return err
+	}
+	now := c.Now()
+	hdr, err := clusterapi.SignHeaders(c.SelfNodeID, c.Secret, http.MethodPost, path, body, now)
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, joinURL(baseURL, path), bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header = hdr
+	resp, err := c.HTTPClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("submit task: status %d", resp.StatusCode)
+	}
+	return nil
 }
 
 // joinURL 拼接基址与路径，处理基址尾斜杠。

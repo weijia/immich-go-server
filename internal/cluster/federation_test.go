@@ -152,7 +152,7 @@ func TestGlobalRepoCrossNodeCoordinator(t *testing.T) {
 	local := &fakeRepo{
 		dirs: []model.Directory{{DirKey: "2026-06", DiskSerial: "DA", Tier: model.TierWarm, Temperature: 0.9, TotalBytes: 5 << 30}},
 	}
-	gr := &GlobalRepo{Disks: disks, Local: local}
+	gr := &GlobalRepo{Disks: disks, Local: local, SelfID: "B"}
 	c := coordinator.New(gr, config.Default())
 	n, err := c.RunBalancingCycle()
 	if err != nil {

@@ -12,7 +12,9 @@ import (
 	"github.com/weijia/immich-go-server/internal/cluster"
 	"github.com/weijia/immich-go-server/internal/clusterapi"
 	"github.com/weijia/immich-go-server/internal/discovery"
+	"github.com/weijia/immich-go-server/internal/model"
 	"github.com/weijia/immich-go-server/internal/store"
+	"github.com/weijia/immich-go-server/internal/worker"
 )
 
 // Config 节点运行配置。
@@ -165,9 +167,68 @@ func (n *Node) Federate(ctx context.Context) (cluster.GlobalView, error) {
 }
 
 // GlobalRepository 基于全局视图构造 coordinator.Repository：磁盘来自跨节点合并，
-// 目录/资产/副本/任务下发仍走本节点 Store。
+// 目录/资产/副本/任务下发仍走本节点 Store；SubmitTask 路由到 dst 所在节点。
 func (n *Node) GlobalRepository(gv cluster.GlobalView) *cluster.GlobalRepo {
-	return &cluster.GlobalRepo{Disks: gv.Disks, Local: n.store}
+	client := cluster.NewClient(n.cfg.NodeID, n.cfg.Secret, n.cfg.MaxSkew)
+	return &cluster.GlobalRepo{
+		Disks:   gv.Disks,
+		Local:   n.store,
+		SelfID:  n.cfg.NodeID,
+		PeerURL: n.peerURLFunc(),
+		Client:  client,
+	}
+}
+
+// peerURLFunc 由发现到的 registry 构造 nodeID→基址 解析器（仅在 peer 出现时可达）。
+func (n *Node) peerURLFunc() func(nodeID string) (string, bool) {
+	return func(nodeID string) (string, bool) {
+		for _, p := range n.reg.Peers() {
+			if p.NodeID == nodeID {
+				return "http://" + p.Addr, true
+			}
+		}
+		return "", false
+	}
+}
+
+// NodeLocator 实现 worker.DiskLocator：磁盘挂载节点取自全局视图，回退本地 Store；
+// 对端基址取自发现 registry。
+type NodeLocator struct {
+	SelfID    string
+	Disks     map[string]model.Disk
+	Store     *store.Store
+	peerURLFn func(nodeID string) (string, bool)
+}
+
+func (l NodeLocator) DiskNode(serial string) (string, bool) {
+	if d, ok := l.Disks[serial]; ok && d.MountedNodeID != "" {
+		return d.MountedNodeID, true
+	}
+	return l.Store.GetDiskLocation(serial)
+}
+
+func (l NodeLocator) PeerURL(nodeID string) (string, bool) {
+	if nodeID == l.SelfID {
+		return "", false
+	}
+	return l.peerURLFn(nodeID)
+}
+
+// Worker 构造本节点的任务执行器：目标盘由全局视图解析，源可来自本节点或远端。
+func (n *Node) Worker(gv cluster.GlobalView) *worker.Worker {
+	return &worker.Worker{
+		NodeID:   n.cfg.NodeID,
+		Secret:   n.cfg.Secret,
+		Repo:     n.store,
+		BlobBase: n.cfg.BlobRoot,
+		Loc: NodeLocator{
+			SelfID:    n.cfg.NodeID,
+			Disks:     gv.Disks,
+			Store:     n.store,
+			peerURLFn: n.peerURLFunc(),
+		},
+		Client: cluster.NewClient(n.cfg.NodeID, n.cfg.Secret, n.cfg.MaxSkew),
+	}
 }
 
 // Close 释放资源（停止 Run 后调用）。

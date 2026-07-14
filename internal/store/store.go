@@ -313,7 +313,23 @@ func (s *Store) ReplicaCount(assetID string) int {
 
 // ListTasks 返回所有已记录任务（用于验证 Coordinator 产出）。
 func (s *Store) ListTasks() ([]clusterapi.Task, error) {
-	rows, err := s.db.Query(`SELECT task_id,type,dir_key,asset_id,src_disk,dst_disk,status FROM task`)
+	return s.listTasks("")
+}
+
+// ListPendingTasks 返回处于某状态（如 "QUEUED"）的任务，供 worker 认领执行。
+func (s *Store) ListPendingTasks(status string) ([]clusterapi.Task, error) {
+	return s.listTasks(status)
+}
+
+func (s *Store) listTasks(statusFilter string) ([]clusterapi.Task, error) {
+	q := `SELECT task_id,type,dir_key,asset_id,src_disk,dst_disk,status FROM task`
+	var rows *sql.Rows
+	var err error
+	if statusFilter != "" {
+		rows, err = s.db.Query(q+` WHERE status=?`, statusFilter)
+	} else {
+		rows, err = s.db.Query(q)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -321,13 +337,78 @@ func (s *Store) ListTasks() ([]clusterapi.Task, error) {
 	var out []clusterapi.Task
 	for rows.Next() {
 		var t clusterapi.Task
-		var status string
-		if err := rows.Scan(&t.TaskID, &t.Type, &t.DirKey, &t.AssetID, &t.SrcDisk, &t.DstDisk, &status); err != nil {
+		if err := rows.Scan(&t.TaskID, &t.Type, &t.DirKey, &t.AssetID, &t.SrcDisk, &t.DstDisk, &t.Status); err != nil {
 			return nil, err
 		}
 		out = append(out, t)
 	}
 	return out, nil
+}
+
+// UpdateTaskStatus 更新任务状态（QUEUED→RUNNING→DONE/FAILED）。
+func (s *Store) UpdateTaskStatus(taskID, status string) error {
+	_, err := s.db.Exec(`UPDATE task SET status=? WHERE task_id=?`, status, taskID)
+	return err
+}
+
+// GetDirectory 读取单个月份目录视图。
+func (s *Store) GetDirectory(dirKey string) (model.Directory, bool, error) {
+	rows, err := s.db.Query(`SELECT dir_key,node_id,disk_serial,tier,temperature,total_bytes,access_score FROM directory WHERE dir_key=?`, dirKey)
+	if err != nil {
+		return model.Directory{}, false, err
+	}
+	defer rows.Close()
+	if !rows.Next() {
+		return model.Directory{}, false, nil
+	}
+	var d model.Directory
+	var tier string
+	if err := rows.Scan(&d.DirKey, &d.NodeID, &d.DiskSerial, &tier, &d.Temperature, &d.TotalBytes, &d.AccessScore); err != nil {
+		return model.Directory{}, false, err
+	}
+	d.Tier = model.Tier(tier)
+	return d, true, nil
+}
+
+// ListAssetsByDir 返回某目录下的全部资产（迁移执行时遍历源文件用）。
+func (s *Store) ListAssetsByDir(dirKey string) ([]model.Asset, error) {
+	rows, err := s.db.Query(`SELECT asset_id,size_bytes,checksum,dir_key FROM asset WHERE dir_key=?`, dirKey)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []model.Asset
+	for rows.Next() {
+		var a model.Asset
+		if err := rows.Scan(&a.AssetID, &a.SizeBytes, &a.Checksum, &a.DirKey); err != nil {
+			return nil, err
+		}
+		out = append(out, a)
+	}
+	return out, nil
+}
+
+// GetAsset 读取单个资产。
+func (s *Store) GetAsset(assetID string) (model.Asset, bool, error) {
+	rows, err := s.db.Query(`SELECT asset_id,size_bytes,checksum,dir_key FROM asset WHERE asset_id=?`, assetID)
+	if err != nil {
+		return model.Asset{}, false, err
+	}
+	defer rows.Close()
+	if !rows.Next() {
+		return model.Asset{}, false, nil
+	}
+	var a model.Asset
+	if err := rows.Scan(&a.AssetID, &a.SizeBytes, &a.Checksum, &a.DirKey); err != nil {
+		return model.Asset{}, false, err
+	}
+	return a, true, nil
+}
+
+// UpdateDirectoryDisk 迁移完成后把目录的归属盘更新为目标盘（§6.5.2）。
+func (s *Store) UpdateDirectoryDisk(dirKey, diskSerial string) error {
+	_, err := s.db.Exec(`UPDATE directory SET disk_serial=? WHERE dir_key=?`, diskSerial, dirKey)
+	return err
 }
 
 // SubmitTask 记录一条集群任务；同一 task_id 幂等（INSERT OR IGNORE）。

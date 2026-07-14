@@ -10,6 +10,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/weijia/immich-go-server/internal/cluster"
 	"github.com/weijia/immich-go-server/internal/config"
 	"github.com/weijia/immich-go-server/internal/coordinator"
 	"github.com/weijia/immich-go-server/internal/diskid"
@@ -79,23 +80,28 @@ func makeTick(nodeID string, diskDirs []string, claimGrace int64) func(context.C
 				log.Printf("claim %s: %v", dir, err)
 			}
 		}
-		// 跨节点聚合：拉取 peer 状态得到全局磁盘视图，再让 Coordinator 跨节点调度；
-		// 联邦失败（如全部 peer 不可达）则回退到本节点本地视图。
-		gv, err := n.Federate(ctx)
-		var repo coordinator.Repository = n.Store()
-		if err != nil {
-			log.Printf("federate: %v (fallback to local view)", err)
+		// 跨节点聚合：拉取 peer 状态得到全局磁盘视图。
+		gv, ferr := n.Federate(ctx)
+		if ferr != nil {
+			log.Printf("federate: %v (skip scheduling)", ferr)
+			gv = cluster.GlobalView{SelfNodeID: nodeID} // worker 仍可处理本地任务
 		} else {
-			repo = n.GlobalRepository(gv)
-			if gv.Coordinator != nodeID {
-				log.Printf("coordinator is %s (self=%s)", gv.Coordinator, nodeID)
+			// 仅当选定协调者才下发任务；多节点结论一致且幂等，安全。
+			if gv.Coordinator == nodeID {
+				repo := n.GlobalRepository(gv)
+				cond := coordinator.New(repo, config.Default())
+				if emitted, err := cond.RunBalancingCycle(); err != nil {
+					log.Printf("balancing cycle: %v", err)
+				} else if emitted > 0 {
+					log.Printf("balancing emitted %d tasks", emitted)
+				}
+			} else {
+				log.Printf("coordinator is %s (self=%s); skipping schedule", gv.Coordinator, nodeID)
 			}
 		}
-		cond := coordinator.New(repo, config.Default())
-		if emitted, err := cond.RunBalancingCycle(); err != nil {
-			log.Printf("balancing cycle: %v", err)
-		} else if emitted > 0 {
-			log.Printf("balancing emitted %d tasks", emitted)
+		// 本节点 worker 始终执行目标盘在本地的任务（含跨节点拉取的字节搬运）。
+		if err := n.Worker(gv).RunOnce(ctx); err != nil {
+			log.Printf("worker: %v", err)
 		}
 	}
 }
