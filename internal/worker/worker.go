@@ -1,9 +1,13 @@
 // Package worker 消费 Store 中的集群任务并执行（§6.5 / §7.2 / §9）。
 //
-// 拓扑采用“拉模型”：Coordinator 把任务下发给 dstDisk 实际挂载的节点
+// 拓扑采用"拉模型"：Coordinator 把任务下发给 dstDisk 实际挂载的节点
 // （见 cluster.GlobalRepo.SubmitTask），因此每个节点只执行目标盘在本地的任务。
-// 源字节可来自本节点（同一 BlobBase 已存在）或经 HMAC 鉴权的远端 blob 端点拉取
-// （migrationexec.RemoteSource）。目标字节落在本节点 BlobBase/<assetID>。
+// 源字节可来自本节点（同一或不同磁盘 blob 根）或经 HMAC 鉴权的远端 blob 端点拉取
+// （migrationexec.RemoteSource）。
+//
+// 物理路径模型（§仓库即真相）：assets 位于 <disk.BlobRoot>/<dirKey>/<assetID>。
+// 每磁盘一个仓库，摄入时已按 dirKey 分桶存放；worker 按 disk 解析 blob_root、
+// 再拼接 dirKey/assetID 定位物理字节。
 package worker
 
 import (
@@ -33,6 +37,7 @@ type Repo interface {
 	DeleteReplica(assetID, diskSerial string) error // 真实源盘释放：删源副本记录
 	SaveDirectory(dir model.Directory) error       // 目录重宿主：领养权威记录
 	GetDiskLocation(serial string) (string, bool)
+	DiskRoot(serial string) (string, bool) // 返回磁盘物理仓库根 (§仓库即真相)
 }
 
 // DiskLocator 解析磁盘挂载节点与对端基址，供跨节点拉取字节。
@@ -44,14 +49,14 @@ type DiskLocator interface {
 }
 
 // Worker 执行本节点待办任务（目标盘在本地）。
+// 物理路径通过 Repo.DiskRoot(serial) 按磁盘解析 blob_root，而非单一 BlobBase。
 type Worker struct {
-	NodeID   string
-	Secret   string
-	Repo     Repo
-	BlobBase string // 本节点 blob 扁平根目录：BlobBase/<assetID>
-	Loc      DiskLocator
-	Client   *cluster.Client
-	Cfg      config.Config
+	NodeID string
+	Secret string
+	Repo   Repo
+	Loc    DiskLocator
+	Client *cluster.Client
+	Cfg    config.Config
 }
 
 // RunOnce 认领全部 QUEUED 任务并依次执行，更新状态为 RUNNING→DONE/FAILED。
@@ -165,12 +170,10 @@ func (w *Worker) rehost(ctx context.Context, t clusterapi.Task, dir model.Direct
 }
 
 // releaseSource 迁移完成后释放源盘（§9.x 真实源盘释放）：
-//  1. 仅释放“删源后仍满足 MinReplicas”的资产（safeToRelease）；其余保留源副本，
-//     避免单副本资产搬完被降到 1 份、违背冗余策略；
-//  2. 删除源物理字节——仅当目标盘不在本节点时（跨节点源在他节点，或同节点但 dst 在他盘）；
-//     同节点盘间迁移共享同一 BlobBase/<assetID> 文件，删字节会误伤目标副本，故保留。
-// 源在本节点（srcNode==本节点）时本地直接删除；源在远端时经 HMAC 通知源节点代为释放，
-// 并明确告知源节点“只释放哪些资产”（门禁决策在本节点完成）。
+//  1. 仅释放"删源后仍满足 MinReplicas"的资产（safeToRelease）；其余保留源副本；
+//  2. 删除源物理字节——按 per-disk 仓库路径 <blobRoot>/<dirKey>/<assetID> 定位；
+//     同节点同根时共享同一文件，删字节会误伤目标副本，故保留。
+// 源在本节点时本地直接删除；源在远端时经 HMAC 通知源节点代为释放。
 func (w *Worker) releaseSource(ctx context.Context, t clusterapi.Task, assets []model.Asset, srcNode string) error {
 	safe := make([]bool, len(assets))
 	for i, a := range assets {
@@ -178,21 +181,25 @@ func (w *Worker) releaseSource(ctx context.Context, t clusterapi.Task, assets []
 	}
 
 	if srcNode == "" || srcNode == w.NodeID {
+		srcRoot, _ := w.Repo.DiskRoot(t.SrcDisk)
 		for i, a := range assets {
 			if !safe[i] {
-				continue // 释放后会低于 MinReplicas，保留源副本与字节
+				continue
 			}
 			if err := w.Repo.DeleteReplica(a.AssetID, t.SrcDisk); err != nil {
 				return err
 			}
-			if dn, ok := w.Loc.DiskNode(t.DstDisk); !ok || dn != w.NodeID {
-				_ = os.Remove(BlobPath(w.BlobBase, a.AssetID))
+			// 仅当 dst 不在本节点同根时才删物理字节（避免误删共享文件）
+			if rd := w.sameDiskRoot(t.SrcDisk, t.DstDisk); !rd {
+				if srcRoot != "" && a.DirKey != "" {
+					_ = os.Remove(filepath.Join(srcRoot, a.DirKey, a.AssetID))
+				}
 			}
 		}
 		return nil
 	}
 
-	// 远端源节点：仅把可安全释放的资产交给它，其余保留在源盘。
+	// 远端源节点：仅把可安全释放的资产交给它
 	var toRelease []string
 	for i, a := range assets {
 		if safe[i] {
@@ -204,6 +211,13 @@ func (w *Worker) releaseSource(ctx context.Context, t clusterapi.Task, assets []
 		return fmt.Errorf("no peer url for src node %s", srcNode)
 	}
 	return w.Client.ReleaseSource(ctx, url, t.DirKey, t.SrcDisk, t.DstDisk, srcNode, toRelease)
+}
+
+// sameDiskRoot 判断两个磁盘是否共享同一物理仓库根（用于避免误删共享文件）。
+func (w *Worker) sameDiskRoot(a, b string) bool {
+	ra, _ := w.Repo.DiskRoot(a)
+	rb, _ := w.Repo.DiskRoot(b)
+	return ra != "" && ra == rb
 }
 
 // safeToRelease 判断删除某资产在 SrcDisk 上的源副本后，剩余有效（HEALTHY）副本数
@@ -267,13 +281,27 @@ func (w *Worker) runReplica(ctx context.Context, t clusterapi.Task) error {
 	})
 }
 
-// copyAssets 把资产字节搬到本节点 DstDisk 的 BlobBase。src 为远端时经 RemoteSource 拉取；
-// src 为本节点（同一 BlobBase 已有字节）则跳过字节搬运。
+// copyAssets 把资产字节搬到本节点 DstDisk。源可为本节点（同节点不同盘用 osBlobStore
+// 内部拷贝；同盘同根则跳过）或远端节点（经 RemoteSource 拉取）。
+// bytes locate at <blobRoot>/<dirKey>/<assetID> (§仓库即真相)。
 func (w *Worker) copyAssets(srcDisk, dstDisk string, assets []model.Asset) error {
-	dstBS := migrationexec.NewOSBlobStore("", w.BlobBase) // 仅作为目标：写 BlobBase/<assetID>
+	if len(assets) == 0 {
+		return nil
+	}
+	dirKey := assets[0].DirKey
+
+	dstRoot, _ := w.Repo.DiskRoot(dstDisk)
+	if dstRoot == "" {
+		return fmt.Errorf("dst disk %s has no blob_root", dstDisk)
+	}
+	dstDir := filepath.Join(dstRoot, dirKey)
+	if err := os.MkdirAll(dstDir, 0o755); err != nil {
+		return err
+	}
 
 	srcNode, _ := w.Loc.DiskNode(srcDisk)
 	if srcNode != "" && srcNode != w.NodeID {
+		// 远端源：经 RemoteBlobStore 拉取，写入本地 dstDir
 		url, ok := w.Loc.PeerURL(srcNode)
 		if !ok {
 			return fmt.Errorf("no peer url for src node %s", srcNode)
@@ -282,9 +310,12 @@ func (w *Worker) copyAssets(srcDisk, dstDisk string, assets []model.Asset) error
 			BaseURL: url,
 			NodeID:  w.NodeID,
 			Secret:  w.Secret,
+			DiskSer: srcDisk,
+			DirKey:  dirKey,
 			Client:  w.Client.HTTPClient,
 			Now:     w.Client.Now,
 		}
+		dstBS := migrationexec.NewOSBlobStore("", dstDir)
 		bs := migrationexec.NewRemoteBlobStore(src, dstBS)
 		exec := migrationexec.NewExecutor(bs, w.cfg())
 		m, err := exec.Start(srcDisk, dstDisk, assets)
@@ -300,7 +331,30 @@ func (w *Worker) copyAssets(srcDisk, dstDisk string, assets []model.Asset) error
 		}
 		return nil
 	}
-	// 源在本节点：字节已存在于 BlobBase/<assetID>，无需搬运（同节点盘间迁移=仅元数据）。
+
+	// 源在本节点：src 盘与 dst 盘是否同一物理仓库根？
+	srcRoot, _ := w.Repo.DiskRoot(srcDisk)
+	srcDir := filepath.Join(srcRoot, dirKey)
+
+	if srcDir == dstDir {
+		// 同盘同根（或同节点多盘共享同一目录）：字节已就位，无需搬运。
+		return nil
+	}
+
+	// 同节点不同盘（不同 blob_root）：用 osBlobStore 在源/目标间拷贝字节。
+	dstBS := migrationexec.NewOSBlobStore(srcDir, dstDir)
+	exec := migrationexec.NewExecutor(dstBS, w.cfg())
+	m, err := exec.Start(srcDisk, dstDisk, assets)
+	if err != nil {
+		return err
+	}
+	st, err := exec.Run(&m, assets)
+	if err != nil {
+		return err
+	}
+	if st != migration.StateVerified {
+		return fmt.Errorf("copy %s->%s not verified: state=%s", srcDisk, dstDisk, st)
+	}
 	return nil
 }
 
@@ -311,7 +365,7 @@ func (w *Worker) cfg() config.Config {
 	return w.Cfg
 }
 
-// BlobPath 返回某资产在本节点的物理路径（BlobBase/<assetID>）。
-func BlobPath(blobBase, assetID string) string {
-	return filepath.Join(blobBase, assetID)
+// BlobPath 返回某资产在给定磁盘仓库中的物理路径（blobRoot/<dirKey>/<assetID>）。
+func BlobPath(blobRoot, dirKey, assetID string) string {
+	return filepath.Join(blobRoot, dirKey, assetID)
 }

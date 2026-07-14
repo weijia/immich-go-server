@@ -15,6 +15,7 @@ import (
 	"github.com/weijia/immich-go-server/internal/coordinator"
 	"github.com/weijia/immich-go-server/internal/diskid"
 	"github.com/weijia/immich-go-server/internal/model"
+	"github.com/weijia/immich-go-server/internal/scanner"
 	"github.com/weijia/immich-go-server/internal/server"
 )
 
@@ -73,11 +74,30 @@ func main() {
 
 // makeTick 返回每轮 Tick 执行的逻辑：认领本地磁盘 + 运行一次调度均衡。
 func makeTick(nodeID string, diskDirs []string, claimGrace int64) func(context.Context, *server.Node) {
+	scanTick := 0
 	return func(ctx context.Context, n *server.Node) {
 		now := time.Now().Unix()
 		for _, dir := range diskDirs {
 			if err := claimDisk(n, dir, nodeID, now, claimGrace); err != nil {
 				log.Printf("claim %s: %v", dir, err)
+			}
+		}
+		// 周期扫描各磁盘仓库，把摄入的物理资产同步进元数据（§仓库即真相）。
+		// 每 4 个 tick（约 60s）跑一次，避免频繁全扫。
+		scanTick++
+		if scanTick%4 == 0 {
+			disks, err := n.Store().ListDisks()
+			if err != nil {
+				log.Printf("list disks: %v", err)
+			} else {
+				for _, d := range disks {
+					if d.BlobRoot == "" {
+						continue
+					}
+					if err := scanner.ScanRepository(n.Store(), d.BlobRoot, d.DiskSerial, nodeID); err != nil {
+						log.Printf("scan %s: %v", d.DiskSerial, err)
+					}
+				}
 			}
 		}
 		// 跨节点聚合：拉取 peer 状态得到全局磁盘视图。
@@ -124,6 +144,7 @@ func claimDisk(n *server.Node, dir, nodeID string, now, grace int64) error {
 		DiskSerial: idFile.DiskID,
 		Label:      idFile.Label,
 		Tier:       model.TierHot, // 真实环境按 SMART/容量判定；此处默认
+		BlobRoot:   dir,           // DISK_DIRS 的目录即该盘的物理仓库根（每磁盘一个仓库）
 		FirstSeenAt: stats.FirstSeenAt,
 		LastSeenAt: now,
 	}

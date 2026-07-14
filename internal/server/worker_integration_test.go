@@ -53,7 +53,7 @@ func TestNodeWorkerCrossNode(t *testing.T) {
 	addrB := waitAddr(t, b)
 
 	// --- 节点 A（协调者候选人）：持有源盘 DA 与目录 d1 的资产/副本 ---
-	if err := a.Store().SaveDisk(model.Disk{DiskSerial: "DA", Tier: model.TierWarm, MountedNodeID: "A", OnlineSeconds: 900, FreeBytes: 50 << 30}); err != nil {
+	if err := a.Store().SaveDisk(model.Disk{DiskSerial: "DA", Tier: model.TierWarm, MountedNodeID: "A", OnlineSeconds: 900, FreeBytes: 50 << 30, BlobRoot: a.cfg.BlobRoot}); err != nil {
 		t.Fatal(err)
 	}
 	if err := a.Store().SaveDirectory(model.Directory{DirKey: "d1", NodeID: "A", DiskSerial: "DA", Tier: model.TierWarm, Temperature: 0.9, TotalBytes: 100}); err != nil {
@@ -66,14 +66,17 @@ func TestNodeWorkerCrossNode(t *testing.T) {
 		if err := a.Store().AddReplica(model.Replica{ReplicaID: id + "@DA", AssetID: id, DiskSerial: "DA", NodeID: "A", Checksum: "c-" + id, Status: "HEALTHY"}); err != nil {
 			t.Fatal(err)
 		}
-		if err := os.WriteFile(filepath.Join(a.cfg.BlobRoot, id), []byte(content), 0o644); err != nil {
+		// per-disk 仓库路径：blobRoot/<dirKey>/<assetID>（§仓库即真相）
+		dp := filepath.Join(a.cfg.BlobRoot, "d1")
+		_ = os.MkdirAll(dp, 0o755)
+		if err := os.WriteFile(filepath.Join(dp, id), []byte(content), 0o644); err != nil {
 			t.Fatal(err)
 		}
 	}
 
 	// --- 节点 B：持有目标盘 DB；预置资产元数据（联邦下副本目录会同步）但不预置目录记录，
 	//     以诚实验证“目录跨节点重宿主”——B 需从 A 拉取目录元数据并领养，再让 A 放弃旧记录。 ---
-	if err := b.Store().SaveDisk(model.Disk{DiskSerial: "DB", Tier: model.TierHot, MountedNodeID: "B", OnlineSeconds: 100, FreeBytes: 90 << 30}); err != nil {
+	if err := b.Store().SaveDisk(model.Disk{DiskSerial: "DB", Tier: model.TierHot, MountedNodeID: "B", OnlineSeconds: 100, FreeBytes: 90 << 30, BlobRoot: b.cfg.BlobRoot}); err != nil {
 		t.Fatal(err)
 	}
 	for _, id := range []string{"a1", "a2"} {
@@ -110,9 +113,9 @@ func TestNodeWorkerCrossNode(t *testing.T) {
 		t.Fatalf("B.Worker: %v", err)
 	}
 
-	// 断言 1：字节已跨节点搬到 B 的 BlobRoot，且内容一致
+	// 断言 1：字节已跨节点搬到 B 的 per-disk 仓库（blobRoot/<dirKey>/<assetID>），且内容一致
 	for id, want := range map[string]string{"a1": "hello-from-A-a1", "a2": "hello-from-A-a2"} {
-		got, err := os.ReadFile(filepath.Join(b.cfg.BlobRoot, id))
+		got, err := os.ReadFile(filepath.Join(b.cfg.BlobRoot, "d1", id))
 		if err != nil {
 			t.Fatalf("B missing blob %s: %v", id, err)
 		}
@@ -159,7 +162,7 @@ func TestNodeWorkerCrossNode(t *testing.T) {
 	}
 	// 断言 4c（真实源盘释放）：A 上 DA 盘的物理字节已删除
 	for _, id := range []string{"a1", "a2"} {
-		if _, err := os.Stat(filepath.Join(a.cfg.BlobRoot, id)); !os.IsNotExist(err) {
+		if _, err := os.Stat(filepath.Join(a.cfg.BlobRoot, "d1", id)); !os.IsNotExist(err) {
 			t.Errorf("A blob %s should be released (deleted), stat err=%v", id, err)
 		}
 	}
@@ -185,7 +188,7 @@ func TestNodeWorkerReplica(t *testing.T) {
 	addrA := waitAddr(t, a)
 
 	// A 持有源副本 + 字节
-	if err := a.Store().SaveDisk(model.Disk{DiskSerial: "DA", Tier: model.TierWarm, MountedNodeID: "A", OnlineSeconds: 900}); err != nil {
+	if err := a.Store().SaveDisk(model.Disk{DiskSerial: "DA", Tier: model.TierWarm, MountedNodeID: "A", OnlineSeconds: 900, BlobRoot: a.cfg.BlobRoot}); err != nil {
 		t.Fatal(err)
 	}
 	if err := a.Store().SaveAsset(model.Asset{AssetID: "a3", SizeBytes: 11, Checksum: "c-a3", DirKey: "d2"}); err != nil {
@@ -194,12 +197,13 @@ func TestNodeWorkerReplica(t *testing.T) {
 	if err := a.Store().AddReplica(model.Replica{ReplicaID: "a3@DA", AssetID: "a3", DiskSerial: "DA", NodeID: "A", Checksum: "c-a3", Status: "HEALTHY"}); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(a.cfg.BlobRoot, "a3"), []byte("replica-src-A"), 0o644); err != nil {
+	_ = os.MkdirAll(filepath.Join(a.cfg.BlobRoot, "d2"), 0o755)
+	if err := os.WriteFile(filepath.Join(a.cfg.BlobRoot, "d2", "a3"), []byte("replica-src-A"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
 	// B 持有目标盘 DB，并预置资产元数据 + 源副本目录（联邦下副本目录同步）
-	if err := b.Store().SaveDisk(model.Disk{DiskSerial: "DB", Tier: model.TierHot, MountedNodeID: "B", OnlineSeconds: 100}); err != nil {
+	if err := b.Store().SaveDisk(model.Disk{DiskSerial: "DB", Tier: model.TierHot, MountedNodeID: "B", OnlineSeconds: 100, BlobRoot: b.cfg.BlobRoot}); err != nil {
 		t.Fatal(err)
 	}
 	if err := b.Store().SaveAsset(model.Asset{AssetID: "a3", SizeBytes: 11, Checksum: "c-a3", DirKey: "d2"}); err != nil {
@@ -212,7 +216,7 @@ func TestNodeWorkerReplica(t *testing.T) {
 	b.Registry().Upsert("A", addrA, time.Now().Unix())
 
 	// 直接把 REPLICA 任务注入 B 的本地库（模拟路由到目标盘所在节点）
-	if err := b.Store().SubmitTask(clusterapi.Task{TaskID: "rep-a3", Type: "REPLICA", AssetID: "a3", DstDisk: "DB"}); err != nil {
+	if err := b.Store().SubmitTask(clusterapi.Task{TaskID: "rep-a3", Type: "REPLICA", AssetID: "a3", SrcDisk: "DA", DstDisk: "DB"}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -224,7 +228,7 @@ func TestNodeWorkerReplica(t *testing.T) {
 		t.Fatalf("B.Worker: %v", err)
 	}
 
-	got, err := os.ReadFile(filepath.Join(b.cfg.BlobRoot, "a3"))
+	got, err := os.ReadFile(filepath.Join(b.cfg.BlobRoot, "d2", "a3"))
 	if err != nil {
 		t.Fatalf("B missing replica blob a3: %v", err)
 	}

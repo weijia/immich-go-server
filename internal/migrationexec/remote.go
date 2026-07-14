@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -14,12 +15,17 @@ import (
 
 // RemoteSource 经 HMAC 鉴权的集群 blob 端点拉取源 blob（§9.1）。
 // 通过 Range 实现字节级续传：OpenSource(offset) 发起 "bytes=<offset>-" 请求。
+// 支持两种定位方式：
+//   - DiskSer + DirKey（非空）：URL 带 ?disk=<serial>&dir=<dirKey>，按每磁盘仓库定位；
+//   - 为空：回退到旧单根 blob 端点（向后兼容）。
 type RemoteSource struct {
-	BaseURL string // 远端节点基址，如 http://node-b:8080
-	NodeID  string // 本节点在集群中的身份（用于签名）
-	Secret  string // 共享集群密钥
-	Client  *http.Client
-	Now     func() int64
+	BaseURL  string // 远端节点基址，如 http://node-b:8080
+	NodeID   string // 本节点在集群中的身份（用于签名）
+	Secret   string // 共享集群密钥
+	DiskSer  string // 可选：源盘序列号（per-disk 仓库定位）
+	DirKey   string // 可选：源目录键（per-disk 仓库定位）
+	Client   *http.Client
+	Now      func() int64
 }
 
 func (r *RemoteSource) client() *http.Client {
@@ -42,7 +48,11 @@ func (r *RemoteSource) sign(method, path string) http.Header {
 }
 
 func (r *RemoteSource) url(assetID string) string {
-	return strings.TrimRight(r.BaseURL, "/") + "/api/cluster/blob/" + assetID
+	u := strings.TrimRight(r.BaseURL, "/") + "/api/cluster/blob/" + assetID
+	if r.DiskSer != "" && r.DirKey != "" {
+		u += "?disk=" + url.QueryEscape(r.DiskSer) + "&dir=" + url.QueryEscape(r.DirKey)
+	}
+	return u
 }
 
 // StatSource 经 "bytes=0-0" 探测总大小（从 Content-Range 解析），不存在返回 ok=false。

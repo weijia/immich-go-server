@@ -23,6 +23,7 @@ type Disk struct {
 	LastTickAt    int64
 	LastSeenAt    int64
 	Suspect       bool
+	BlobRoot      string // 该盘的物理仓库根目录（每磁盘一个仓库，§仓库即真相）
 }
 
 // Node 一个运行中的服务器实例（§2）。
@@ -37,10 +38,11 @@ type Node struct {
 
 // Asset 一个照片/视频资产（§2）。
 type Asset struct {
-	AssetID   string
-	SizeBytes int64
-	Checksum  string
-	DirKey    string
+	AssetID      string
+	SizeBytes    int64
+	Checksum     string
+	DirKey       string
+	OriginalPath string // 摄入前的原始路径（保留原路径信息，便于导出还原，§仓库即真相）
 }
 
 // Replica 某 asset 在某磁盘上的一份物理拷贝（§2 / §8.3）。

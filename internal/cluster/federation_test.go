@@ -28,6 +28,7 @@ func (f *fakeProvider) GetState() clusterapi.StatePayload { return f.state }
 func (f *fakeProvider) GetDiskLocation(serial string) (string, bool) {
 	return "", false
 }
+func (f *fakeProvider) DiskRoot(string) (string, bool) { return "", false }
 func (f *fakeProvider) RegisterReplica(assetID, diskSerial, checksum string) error {
 	return nil
 }

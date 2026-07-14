@@ -34,6 +34,7 @@ type noopProvider struct{}
 
 func (noopProvider) GetState() clusterapi.StatePayload { return clusterapi.StatePayload{} }
 func (noopProvider) GetDiskLocation(string) (string, bool) { return "", false }
+func (noopProvider) DiskRoot(string) (string, bool)        { return "", false }
 func (noopProvider) RegisterReplica(string, string, string) error { return nil }
 func (noopProvider) SubmitTask(clusterapi.Task) error             { return nil }
 

@@ -171,6 +171,57 @@ func TestDirectoryRoundTrip(t *testing.T) {
 	}
 }
 
+// TestSaveDirectoryLWW 验证目录放置图的 LWW upsert（§8.6 控制面）：
+// 仅当传入 last_eval_at 严格更大时才覆盖既有记录；较旧或相等时间戳的记录
+// 不得回退/冲掉已持有的较新放置。这正是节点下线后聚合持久化时，对端发来的
+// 陈旧副本不会破坏本地正确放置的基础保证。
+func TestSaveDirectoryLWW(t *testing.T) {
+	s := newTestStore(t)
+	const key = "2026/06"
+
+	// 1) 较旧(100)先、较新(200)后 → 较新覆盖较旧
+	if err := s.SaveDirectory(model.Directory{DirKey: key, NodeID: "B", DiskSerial: "DB-old", LastEvalAt: 100}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SaveDirectory(model.Directory{DirKey: key, NodeID: "B", DiskSerial: "DB-new", LastEvalAt: 200}); err != nil {
+		t.Fatal(err)
+	}
+	d, ok, err := s.GetDirectory(key)
+	if err != nil || !ok {
+		t.Fatalf("GetDirectory: ok=%v err=%v", ok, err)
+	}
+	if d.DiskSerial != "DB-new" {
+		t.Fatalf("newer ts should win, got %+v", d)
+	}
+
+	// 2) 较旧(150)再来 → 不得回退覆盖较新(200)
+	if err := s.SaveDirectory(model.Directory{DirKey: key, NodeID: "B", DiskSerial: "DB-stale", LastEvalAt: 150}); err != nil {
+		t.Fatal(err)
+	}
+	d2, _, _ := s.GetDirectory(key)
+	if d2.DiskSerial != "DB-new" {
+		t.Fatalf("stale (150) must not overwrite newer (200): got %+v", d2)
+	}
+
+	// 3) 相等(200)再来 → 严格 > 不满足，仍保留较新内容
+	if err := s.SaveDirectory(model.Directory{DirKey: key, NodeID: "B", DiskSerial: "DB-eq", LastEvalAt: 200}); err != nil {
+		t.Fatal(err)
+	}
+	d3, _, _ := s.GetDirectory(key)
+	if d3.DiskSerial != "DB-new" {
+		t.Fatalf("equal ts (200) must not overwrite (strict >): got %+v", d3)
+	}
+
+	// 4) 严格更大(300)再来 → 覆盖
+	if err := s.SaveDirectory(model.Directory{DirKey: key, NodeID: "B", DiskSerial: "DB-fresh", LastEvalAt: 300}); err != nil {
+		t.Fatal(err)
+	}
+	d4, _, _ := s.GetDirectory(key)
+	if d4.DiskSerial != "DB-fresh" {
+		t.Fatalf("strictly larger ts should overwrite, got %+v", d4)
+	}
+}
+
 func TestSubmitTaskIdempotent(t *testing.T) {
 	s := newTestStore(t)
 	task := clusterapi.Task{TaskID: "t1", Type: "MIGRATION", DirKey: "2026-06", SrcDisk: "A", DstDisk: "B"}

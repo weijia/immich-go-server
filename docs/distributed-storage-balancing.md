@@ -740,7 +740,7 @@ CREATE INDEX idx_directory_disk ON directory(disk_serial);
 ### 8.6.3 控制面内容（disk + directory）
 
 - **`disk`**：已在 §8.1 定义，且经 `/state` 上报 + `AggregateDiskStats` 聚合（§4.3），本就是控制面。无需额外改动。
-- **`directory`（目录放置图）**：§8.5 定义的聚合视图，需从"本机缓存"升格为"跨节点共享放置图"。每个节点本地维护一份 **全局目录放置表**（下称 `directory_global`），内容为集群内**所有**月份目录的 `dir_key / node_id / disk_serial / tier / temperature / total_bytes / access_score / last_eval_at`。
+- **`directory`（目录放置图）**：§8.5 定义的聚合视图，需从"本机缓存"升格为"跨节点共享放置图"。每个节点的 `directory` 表经 `/state` 拉取聚合（`AggregateDirectoryStats` LWW）后即为**全集群目录放置图**（本机持久化、单节点下线不丢失），内容为集群内**所有**月份目录的 `dir_key / node_id / disk_serial / tier / temperature / total_bytes / access_score / last_eval_at`。
 
 ### 8.6.4 数据面内容（replica + asset + blob）
 
@@ -771,7 +771,7 @@ CREATE INDEX idx_directory_disk ON directory(disk_serial);
 | 数据 | B、C 离线后 A 是否可见 | 能否据此均衡 |
 |------|------------------------|--------------|
 | `disk`（D-B/D-C） | 可见（/state 聚合 + `graceOffline` 后可认领） | 能：标记离线、触发重宿主 |
-| `directory`（d1 在 D-B） | **可见**（§8.6.5 复制全量） | 能：Coordinator 知"d1 需重宿主/再均衡" |
+| `directory`（d1 在 D-B） | **可见**（§8.6.5 拉取聚合持久化） | 能：Coordinator 知"d1 需重宿主/再均衡" |
 | `replica`（d1 内各文件副本分布） | **不可见**（数据面本地） | 不能直接发 `REPLICA` 任务修复 |
 | `asset`（d1 内文件清单） | 不可见（数据面本地） | 同上 |
 
@@ -782,7 +782,7 @@ CREATE INDEX idx_directory_disk ON directory(disk_serial);
 文件级修复的盲区靠**磁盘认领 + 盘上自描述清单**闭合，而非复制 `replica` 表：
 
 - B、C 离线超 `graceOffline` 后，A 认领 D-B（§11.3）：扫描该盘每个月份目录的 `.immich-dir.json`（§8.5.1），**批量重建本地 `replica` / `asset` 索引**。
-- 此时 A 的 `directory_global` 已知"d1 曾在 D-B"，认领后把 `d1.disk_serial` 更新为 A 本地盘、并复制该变更 → 目录放置图收敛。
+- 此时 A 的 `directory` 表已知"d1 曾在 D-B"（来自 §8.6.5 的拉取聚合持久化），认领后把 `d1.disk_serial` 更新为 A 本地盘，下一轮 `/state` 拉取聚合即让目录放置图收敛。
 - 重建出的 `replica` 若使某 asset 副本数 `< MinReplicas`，A 本地的 `CheckReplicas`（§7.2）即可正常下发补副本任务。
 
 > 因此本设计是自洽的：**目录级共享负责"决策可见性"（小数据量），文件级修复靠"认领盘 + 扫盘上清单重建索引"（不复制大索引）**。二者配合，B、C 离线后既能正确决策、又能最终自愈，而跨节点共享的数据量始终维持在小头。
@@ -1168,7 +1168,10 @@ sig = HMAC-SHA256(clusterSecret, canonical)
 - [ ] `GET /api/cluster/state`（按需拉取）；可选轻量存活上报（§9.1）
 - [ ] **目录放置图跨节点共享**：`directory` 经 `/state` 拉取聚合（`AggregateDirectoryStats` LWW）+ 持久化到本机库（控制面共享，§8.6.5）
 - [ ] Coordinator 选举（§10）
-- [ ] 验收：关掉当前 Coordinator，另一在线节点在 `COORD_TIMEOUT` 内自动当选并接管决策；`clusterSecret` 握手下发成功、HMAC 验签通过（§9.5）；**任一节点离线后，其余节点的 `directory_global` 仍含其目录放置记录，Coordinator 能正确决策重宿主**
+- [ ] 验收：关掉当前 Coordinator，另一在线节点在 `COORD_TIMEOUT` 内自动当选并接管决策；`clusterSecret` 握手下发成功、HMAC 验签通过（§9.5）；**任一节点离线后，其余节点的 `directory` 表仍含其目录放置记录，Coordinator 能正确决策重宿主**，由以下用例覆盖：
+  - `TestAggregateDirectoryStats`（`cluster` 包）：聚合层 LWW——同 `dir_key` 多节点上报取 `last_eval_at` 较大者，平票取 `nodeId` 较大者（确定性）。
+  - `TestNodeFederateRetainsOfflineDirectories`（`server` 包）：节点层——B、C 下线后 A 的本地 `directory` 表仍保留其目录放置图（含 owner 与所在盘），经 `GlobalRepo.ListDirectories` 仍可见，Coordinator 可据此决策重宿主。
+  - `TestSaveDirectoryLWW`（`store` 包）：存储层——持久化时较旧/相等 `last_eval_at` 不会回退覆盖较新放置（对端陈旧副本不破坏本地正确放置）。
 
 ### 阶段三：副本保证（R3，最高优先业务价值）
 - [ ] 副本健康检查（§7.2）

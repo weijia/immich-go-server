@@ -31,6 +31,7 @@ func (f *fakeProvider) GetDiskLocation(s string) (string, bool) {
 	n, ok := f.location[s]
 	return n, ok
 }
+func (f *fakeProvider) DiskRoot(string) (string, bool) { return "", false }
 func (f *fakeProvider) RegisterReplica(assetID, diskSerial, checksum string) error {
 	f.regs = append(f.regs, assetID+"@"+diskSerial)
 	return nil

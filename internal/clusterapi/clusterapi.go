@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -92,6 +93,7 @@ func DirectoryFromModel(d model.Directory) DirectoryDTO {
 type StateProvider interface {
 	GetState() StatePayload
 	GetDiskLocation(diskSerial string) (string, bool) // 返回 mountedNodeID
+	DiskRoot(diskSerial string) (string, bool)          // 返回磁盘物理仓库根（blob_root），§仓库即真相
 	RegisterReplica(assetID, diskSerial, checksum string) error
 	SubmitTask(task Task) error
 	GetDirectory(dirKey string) (model.Directory, bool, error) // 目录重宿主：读本地目录元数据
@@ -116,8 +118,8 @@ type Handler struct {
 	MaxSkew  int64
 	Now      func() int64
 	Provider StateProvider
-	Source   BlobSource // 可选：提供 blob 拉取（§9.1）
-	BlobBase string     // 可选：本节点 blob 扁平根目录，用于源盘释放时删除物理字节
+	Source   BlobSource // 可选：提供 blob 拉取（§9.1），无 disk/dir 查询参数时作为回退
+	BlobRoot string     // 回退：单根 blob 目录，仅在 Provider.DiskRoot() 查不到时使用
 
 	mu   sync.Mutex
 	seen map[string]bool
@@ -320,7 +322,7 @@ func (h *Handler) handleRehostDirectory(w http.ResponseWriter, r *http.Request) 
 // 仅当本节点正是被要求释放的源节点时才执行——
 //  1. 删除该目录下所有资产在 SrcDisk 上的副本记录；
 //  2. 仅当 DstDisk 不在本节点（GetDiskLocation 未知或挂载他节点）时才删除物理字节，
-//     因为同节点盘间迁移共享同一 BlobBase/<assetID> 文件，删字节会误伤目标副本。
+//     因为同节点盘间迁移可能共享同一仓库根下的文件，删字节会误伤目标副本。
 // 幂等且对称——同一请求发给两端，只有源节点会执行。
 func (h *Handler) handleReleaseSource(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -369,11 +371,15 @@ func (h *Handler) handleReleaseSource(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		if node, ok := h.Provider.GetDiskLocation(req.DstDisk); !ok || node != h.NodeID {
+			root, _ := h.Provider.DiskRoot(req.SrcDisk)
+			if root == "" {
+				root = h.BlobRoot // 回退：Provider 未记录 blob_root 时使用单根
+			}
 			for _, a := range assets {
 				if !allow[a.AssetID] {
 					continue
 				}
-				_ = os.Remove(filepath.Join(h.BlobBase, a.AssetID))
+				_ = os.Remove(filepath.Join(root, req.DirKey, a.AssetID))
 			}
 		}
 	}
@@ -381,20 +387,66 @@ func (h *Handler) handleReleaseSource(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleBlob 提供 blob 字节流拉取（§9.1），支持 Range 续传（206）。
+// 支持两种定位方式：
+//   - 带 ?disk=<diskSerial>&dir=<dirKey>：按每磁盘仓库（blob_root/<dirKey>/<assetID>）定位；
+//   - 无查询参数：回退到 h.Source（单根 FileSystemBlobSource，向后兼容）。
 func (h *Handler) handleBlob(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	if h.Source == nil {
-		http.Error(w, "blob source not configured", http.StatusNotImplemented)
-		return
-	}
 	assetID := lastPathSeg(r.URL.Path, "/api/cluster/blob/")
-	size, checksum, ok := h.Source.StatBlob(assetID)
-	if !ok {
-		http.Error(w, "blob not found", http.StatusNotFound)
-		return
+	disk := r.URL.Query().Get("disk")
+	dirKey := r.URL.Query().Get("dir")
+
+	var size int64
+	var checksum string
+	var src io.ReadCloser
+	var err error
+
+	if disk != "" && dirKey != "" {
+		// 每磁盘仓库路径：blobRoot/<dirKey>/<assetID>
+		root, ok := h.Provider.DiskRoot(disk)
+		if !ok && h.BlobRoot != "" {
+			root = h.BlobRoot
+		}
+		if root == "" {
+			http.Error(w, "disk blob root not found", http.StatusNotFound)
+			return
+		}
+		// 避免目录穿越：dirKey 与 assetID 均不得含 ".."
+		if strings.Contains(dirKey, "..") || strings.Contains(assetID, "..") {
+			http.Error(w, "invalid path", http.StatusBadRequest)
+			return
+		}
+		phys := filepath.Join(root, dirKey, assetID)
+		fi, serr := os.Stat(phys)
+		if serr != nil {
+			http.Error(w, "blob not found", http.StatusNotFound)
+			return
+		}
+		size = fi.Size()
+		src, err = os.Open(phys)
+		if err != nil {
+			http.Error(w, "open failed", http.StatusInternalServerError)
+			return
+		}
+	} else {
+		if h.Source == nil {
+			http.Error(w, "blob source not configured", http.StatusNotImplemented)
+			return
+		}
+		var ok bool
+		size, checksum, ok = h.Source.StatBlob(assetID)
+		if !ok {
+			http.Error(w, "blob not found", http.StatusNotFound)
+			return
+		}
+		src, err = h.Source.OpenBlob(assetID, 0)
+		if err != nil {
+			http.Error(w, "open failed", http.StatusInternalServerError)
+			return
+		}
 	}
 
 	w.Header().Set("Content-Type", "application/octet-stream")
@@ -405,27 +457,46 @@ func (h *Handler) handleBlob(w http.ResponseWriter, r *http.Request) {
 
 	rng := r.Header.Get("Range")
 	if rng == "" {
-		rc, err := h.Source.OpenBlob(assetID, 0)
-		if err != nil {
-			http.Error(w, "open failed", http.StatusInternalServerError)
-			return
-		}
-		defer rc.Close()
+		defer src.Close()
 		w.Header().Set("Content-Length", strconv.FormatInt(size, 10))
-		io.Copy(w, rc)
+		io.Copy(w, src)
 		return
 	}
 
+	_ = src.Close()
 	start, end, ok := parseByteRange(rng, size)
 	if !ok {
 		w.Header().Set("Content-Range", "bytes */"+strconv.FormatInt(size, 10))
 		http.Error(w, "range not satisfiable", http.StatusRequestedRangeNotSatisfiable)
 		return
 	}
-	rc, err := h.Source.OpenBlob(assetID, start)
-	if err != nil {
-		http.Error(w, "open failed", http.StatusInternalServerError)
-		return
+	// 重新打开（按 per-disk 或 Source），并定位到 start 偏移
+	var rc io.ReadCloser
+	if disk != "" && dirKey != "" {
+		root, _ := h.Provider.DiskRoot(disk)
+		if root == "" {
+			root = h.BlobRoot
+		}
+		f, serr := os.Open(filepath.Join(root, dirKey, assetID))
+		if serr != nil {
+			http.Error(w, "open failed", http.StatusInternalServerError)
+			return
+		}
+		if start > 0 {
+			if _, serr := f.Seek(start, io.SeekStart); serr != nil {
+				f.Close()
+				http.Error(w, "seek failed", http.StatusInternalServerError)
+				return
+			}
+		}
+		rc = f
+	} else {
+		var serr error
+		rc, serr = h.Source.OpenBlob(assetID, start)
+		if serr != nil {
+			http.Error(w, "open failed", http.StatusInternalServerError)
+			return
+		}
 	}
 	defer rc.Close()
 	w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, size))

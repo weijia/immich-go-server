@@ -19,7 +19,8 @@ type Store struct {
 	nodeID string
 }
 
-// schema 建表（disk / node / replica / directory / task）。
+// schema 建表（disk / node / replica / directory / asset / task）。
+// disk 增加 blob_root（每磁盘仓库根）；asset 增加 original_path（保留摄入前原路径）。
 const schema = `
 CREATE TABLE IF NOT EXISTS disk (
   disk_serial    TEXT PRIMARY KEY,
@@ -31,7 +32,8 @@ CREATE TABLE IF NOT EXISTS disk (
   online_seconds INTEGER,
   first_seen_at  INTEGER,
   last_seen_at   INTEGER,
-  suspect        INTEGER
+  suspect        INTEGER,
+  blob_root      TEXT DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS node (
   node_id      TEXT PRIMARY KEY,
@@ -58,10 +60,11 @@ CREATE TABLE IF NOT EXISTS directory (
   last_eval_at INTEGER DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS asset (
-  asset_id   TEXT PRIMARY KEY,
-  size_bytes INTEGER,
-  checksum   TEXT,
-  dir_key    TEXT
+  asset_id      TEXT PRIMARY KEY,
+  size_bytes    INTEGER,
+  checksum      TEXT,
+  dir_key       TEXT,
+  original_path TEXT DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS task (
   task_id   TEXT PRIMARY KEY,
@@ -96,20 +99,20 @@ func (s *Store) Close() error { return s.db.Close() }
 // SaveDisk 插入或更新一块磁盘记录。
 func (s *Store) SaveDisk(d model.Disk) error {
 	_, err := s.db.Exec(`
-INSERT INTO disk (disk_serial,label,capacity_bytes,free_bytes,tier,mounted_node_id,online_seconds,first_seen_at,last_seen_at,suspect)
-VALUES (?,?,?,?,?,?,?,?,?,?)
+INSERT INTO disk (disk_serial,label,capacity_bytes,free_bytes,tier,mounted_node_id,online_seconds,first_seen_at,last_seen_at,suspect,blob_root)
+VALUES (?,?,?,?,?,?,?,?,?,?,?)
 ON CONFLICT(disk_serial) DO UPDATE SET
   label=excluded.label, capacity_bytes=excluded.capacity_bytes, free_bytes=excluded.free_bytes,
   tier=excluded.tier, mounted_node_id=excluded.mounted_node_id, online_seconds=excluded.online_seconds,
   last_seen_at=excluded.last_seen_at, suspect=excluded.suspect`,
 		d.DiskSerial, d.Label, d.CapacityBytes, d.FreeBytes, string(d.Tier),
-		d.MountedNodeID, d.OnlineSeconds, d.FirstSeenAt, d.LastSeenAt, boolToInt(d.Suspect))
+		d.MountedNodeID, d.OnlineSeconds, d.FirstSeenAt, d.LastSeenAt, boolToInt(d.Suspect), d.BlobRoot)
 	return err
 }
 
 // GetDisk 读取单块磁盘；不存在返回 ok=false。
 func (s *Store) GetDisk(serial string) (model.Disk, bool, error) {
-	rows, err := s.db.Query(`SELECT disk_serial,label,capacity_bytes,free_bytes,tier,mounted_node_id,online_seconds,first_seen_at,last_seen_at,suspect FROM disk WHERE disk_serial=?`, serial)
+	rows, err := s.db.Query(`SELECT disk_serial,label,capacity_bytes,free_bytes,tier,mounted_node_id,online_seconds,first_seen_at,last_seen_at,suspect,blob_root FROM disk WHERE disk_serial=?`, serial)
 	if err != nil {
 		return model.Disk{}, false, err
 	}
@@ -123,7 +126,7 @@ func (s *Store) GetDisk(serial string) (model.Disk, bool, error) {
 
 // ListDisks 返回所有磁盘。
 func (s *Store) ListDisks() ([]model.Disk, error) {
-	rows, err := s.db.Query(`SELECT disk_serial,label,capacity_bytes,free_bytes,tier,mounted_node_id,online_seconds,first_seen_at,last_seen_at,suspect FROM disk`)
+	rows, err := s.db.Query(`SELECT disk_serial,label,capacity_bytes,free_bytes,tier,mounted_node_id,online_seconds,first_seen_at,last_seen_at,suspect,blob_root FROM disk`)
 	if err != nil {
 		return nil, err
 	}
@@ -172,13 +175,14 @@ func (s *Store) ClaimOrTouchDisk(serial, nodeID string, now, graceOffline int64)
 
 func scanDisk(rows *sql.Rows) (model.Disk, error) {
 	var d model.Disk
-	var tier, mounted string
+	var tier, mounted, blobRoot string
 	var suspect int
-	if err := rows.Scan(&d.DiskSerial, &d.Label, &d.CapacityBytes, &d.FreeBytes, &tier, &mounted, &d.OnlineSeconds, &d.FirstSeenAt, &d.LastSeenAt, &suspect); err != nil {
+	if err := rows.Scan(&d.DiskSerial, &d.Label, &d.CapacityBytes, &d.FreeBytes, &tier, &mounted, &d.OnlineSeconds, &d.FirstSeenAt, &d.LastSeenAt, &suspect, &blobRoot); err != nil {
 		return model.Disk{}, err
 	}
 	d.Tier = model.Tier(tier)
 	d.MountedNodeID = mounted
+	d.BlobRoot = blobRoot
 	d.Suspect = suspect != 0
 	return d, nil
 }
@@ -285,25 +289,25 @@ func (s *Store) ListDirectories() ([]model.Directory, error) {
 
 // ---- asset (§8) ----
 
-// SaveAsset 记录一个资产（size/checksum/dir_key）。
+// SaveAsset 记录一个资产（size/checksum/dir_key/original_path）。
 func (s *Store) SaveAsset(a model.Asset) error {
-	_, err := s.db.Exec(`INSERT INTO asset (asset_id,size_bytes,checksum,dir_key) VALUES (?,?,?,?)
+	_, err := s.db.Exec(`INSERT INTO asset (asset_id,size_bytes,checksum,dir_key,original_path) VALUES (?,?,?,?,?)
 ON CONFLICT(asset_id) DO UPDATE SET size_bytes=excluded.size_bytes, checksum=excluded.checksum, dir_key=excluded.dir_key`,
-		a.AssetID, a.SizeBytes, a.Checksum, a.DirKey)
+		a.AssetID, a.SizeBytes, a.Checksum, a.DirKey, a.OriginalPath)
 	return err
 }
 
 // ListAssets 返回所有资产。
 func (s *Store) ListAssets() ([]model.Asset, error) {
-	rows, err := s.db.Query(`SELECT asset_id,size_bytes,checksum,dir_key FROM asset`)
+	rows, err := s.db.Query(`SELECT asset_id,size_bytes,checksum,dir_key,original_path FROM asset`)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	var out []model.Asset
 	for rows.Next() {
-		var a model.Asset
-		if err := rows.Scan(&a.AssetID, &a.SizeBytes, &a.Checksum, &a.DirKey); err != nil {
+		a, err := scanAsset(rows)
+		if err != nil {
 			return nil, err
 		}
 		out = append(out, a)
@@ -380,15 +384,15 @@ func (s *Store) GetDirectory(dirKey string) (model.Directory, bool, error) {
 
 // ListAssetsByDir 返回某目录下的全部资产（迁移执行时遍历源文件用）。
 func (s *Store) ListAssetsByDir(dirKey string) ([]model.Asset, error) {
-	rows, err := s.db.Query(`SELECT asset_id,size_bytes,checksum,dir_key FROM asset WHERE dir_key=?`, dirKey)
+	rows, err := s.db.Query(`SELECT asset_id,size_bytes,checksum,dir_key,original_path FROM asset WHERE dir_key=?`, dirKey)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	var out []model.Asset
 	for rows.Next() {
-		var a model.Asset
-		if err := rows.Scan(&a.AssetID, &a.SizeBytes, &a.Checksum, &a.DirKey); err != nil {
+		a, err := scanAsset(rows)
+		if err != nil {
 			return nil, err
 		}
 		out = append(out, a)
@@ -398,7 +402,7 @@ func (s *Store) ListAssetsByDir(dirKey string) ([]model.Asset, error) {
 
 // GetAsset 读取单个资产。
 func (s *Store) GetAsset(assetID string) (model.Asset, bool, error) {
-	rows, err := s.db.Query(`SELECT asset_id,size_bytes,checksum,dir_key FROM asset WHERE asset_id=?`, assetID)
+	rows, err := s.db.Query(`SELECT asset_id,size_bytes,checksum,dir_key,original_path FROM asset WHERE asset_id=?`, assetID)
 	if err != nil {
 		return model.Asset{}, false, err
 	}
@@ -406,11 +410,19 @@ func (s *Store) GetAsset(assetID string) (model.Asset, bool, error) {
 	if !rows.Next() {
 		return model.Asset{}, false, nil
 	}
+	a, err := scanAsset(rows)
+	return a, true, err
+}
+
+func scanAsset(rows *sql.Rows) (model.Asset, error) {
 	var a model.Asset
-	if err := rows.Scan(&a.AssetID, &a.SizeBytes, &a.Checksum, &a.DirKey); err != nil {
-		return model.Asset{}, false, err
+	var dirKey, orig string
+	if err := rows.Scan(&a.AssetID, &a.SizeBytes, &a.Checksum, &dirKey, &orig); err != nil {
+		return model.Asset{}, err
 	}
-	return a, true, nil
+	a.DirKey = dirKey
+	a.OriginalPath = orig
+	return a, nil
 }
 
 // UpdateDirectoryDisk 迁移完成后把目录的归属盘更新为目标盘（§6.5.2）。
@@ -419,8 +431,6 @@ func (s *Store) UpdateDirectoryDisk(dirKey, diskSerial string) error {
 	return err
 }
 
-// RelinquishDirectory 删除本地目录聚合记录（§9.x 目录跨节点重宿主）：
-// 当目录数据已迁到他节点后，源节点应放弃其陈旧的目录视图。
 // RelinquishDirectory 目录重宿主时放弃本地陈旧的目录放置记录（§9.x）。
 // 升格为全局放置图（§8.6）后，目录行按 dir_key 唯一且记录最新 owner；
 // 为避免误删对端刚写的最新放置，仅当本节点仍是该记录的登记 owner 时才删除。
@@ -469,6 +479,16 @@ func (s *Store) GetState() clusterapi.StatePayload {
 		ddtos = append(ddtos, clusterapi.DirectoryFromModel(d))
 	}
 	return clusterapi.StatePayload{NodeID: s.nodeID, Disks: out, Directories: ddtos}
+}
+
+// DiskRoot 返回磁盘的物理仓库根（blob_root），ok=false 表示未知或未设置。
+// 用于 worker/blob handler 按磁盘解析物理字节路径。
+func (s *Store) DiskRoot(diskSerial string) (string, bool) {
+	d, ok, _ := s.GetDisk(diskSerial)
+	if !ok || d.BlobRoot == "" {
+		return "", false
+	}
+	return d.BlobRoot, true
 }
 
 // GetDiskLocation 返回磁盘当前挂载节点（§9.4）。

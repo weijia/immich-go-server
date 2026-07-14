@@ -65,7 +65,7 @@ func New(cfg Config) (*Node, error) {
 	if cfg.BlobRoot != "" {
 		h.Source = clusterapi.FileSystemBlobSource{Root: cfg.BlobRoot}
 	}
-	h.BlobBase = cfg.BlobRoot // 供源盘释放时删除本节点物理字节
+	h.BlobRoot = cfg.BlobRoot // 回退：Provider.DiskRoot() 查不到时用此单根
 	n := &Node{cfg: cfg, store: st, api: h, reg: discovery.NewRegistry()}
 
 	if cfg.DiscoverAddr != "" {
@@ -229,10 +229,9 @@ func (l NodeLocator) PeerURL(nodeID string) (string, bool) {
 // Worker 构造本节点的任务执行器：目标盘由全局视图解析，源可来自本节点或远端。
 func (n *Node) Worker(gv cluster.GlobalView) *worker.Worker {
 	return &worker.Worker{
-		NodeID:   n.cfg.NodeID,
-		Secret:   n.cfg.Secret,
-		Repo:     n.store,
-		BlobBase: n.cfg.BlobRoot,
+		NodeID: n.cfg.NodeID,
+		Secret: n.cfg.Secret,
+		Repo:   n.store,
 		Loc: NodeLocator{
 			SelfID:    n.cfg.NodeID,
 			Disks:     gv.Disks,

@@ -18,8 +18,8 @@ type localLocator struct{}
 func (localLocator) DiskNode(serial string) (string, bool) { return "X", true }
 func (localLocator) PeerURL(nodeID string) (string, bool)  { return "", false }
 
-// TestWorkerLocalMigration 同节点迁移：源/目标盘均在本节点，字节已在 BlobBase，
-// worker 仅更新目录归属盘并登记目标副本（拉模型下本节点无需字节搬运）。
+// TestWorkerLocalMigration 同节点迁移：源/目标盘均在本节点，共享同一 blob_root，
+// worker 仅更新目录归属盘并登记目标副本（同根无需字节搬运）。
 func TestWorkerLocalMigration(t *testing.T) {
 	dir := t.TempDir()
 	db := filepath.Join(dir, "s.db")
@@ -33,10 +33,10 @@ func TestWorkerLocalMigration(t *testing.T) {
 	}
 	defer st.Close()
 
-	if err := st.SaveDisk(model.Disk{DiskSerial: "DA", Tier: model.TierWarm, MountedNodeID: "X"}); err != nil {
+	if err := st.SaveDisk(model.Disk{DiskSerial: "DA", Tier: model.TierWarm, MountedNodeID: "X", BlobRoot: blob}); err != nil {
 		t.Fatal(err)
 	}
-	if err := st.SaveDisk(model.Disk{DiskSerial: "DB", Tier: model.TierHot, MountedNodeID: "X"}); err != nil {
+	if err := st.SaveDisk(model.Disk{DiskSerial: "DB", Tier: model.TierHot, MountedNodeID: "X", BlobRoot: blob}); err != nil {
 		t.Fatal(err)
 	}
 	if err := st.SaveDirectory(model.Directory{DirKey: "d1", NodeID: "X", DiskSerial: "DA", Tier: model.TierWarm}); err != nil {
@@ -48,7 +48,11 @@ func TestWorkerLocalMigration(t *testing.T) {
 	if err := st.AddReplica(model.Replica{ReplicaID: "a1@DA", AssetID: "a1", DiskSerial: "DA", NodeID: "X", Checksum: "c1", Status: "HEALTHY"}); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(blob, "a1"), []byte("abc"), 0o644); err != nil {
+	// 物理字节在 blob/d1/a1（per-disk 仓库 + dir_key 子目录，§仓库即真相）
+	if err := os.MkdirAll(filepath.Join(blob, "d1"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(blob, "d1", "a1"), []byte("abc"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if err := st.SubmitTask(clusterapi.Task{TaskID: "mig-d1", Type: "MIGRATION", DirKey: "d1", SrcDisk: "DA", DstDisk: "DB"}); err != nil {
@@ -56,13 +60,12 @@ func TestWorkerLocalMigration(t *testing.T) {
 	}
 
 	w := &Worker{
-		NodeID:   "X",
-		Secret:   "sec",
-		Repo:     st,
-		BlobBase: blob,
-		Loc:      localLocator{},
-		Client:   nil, // 本节点路径不会用到远端客户端
-		Cfg:      config.Default(),
+		NodeID: "X",
+		Secret: "sec",
+		Repo:   st,
+		Loc:    localLocator{},
+		Client: nil, // 本节点路径不会用到远端客户端
+		Cfg:    config.Default(),
 	}
 	if err := w.RunOnce(context.Background()); err != nil {
 		t.Fatalf("RunOnce: %v", err)
