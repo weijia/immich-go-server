@@ -163,29 +163,70 @@ func (w *Worker) rehost(ctx context.Context, t clusterapi.Task, dir model.Direct
 }
 
 // releaseSource 迁移完成后释放源盘（§9.x 真实源盘释放）：
-//  1. 删除目录在 SrcDisk 上的源副本记录；
+//  1. 仅释放“删源后仍满足 MinReplicas”的资产（safeToRelease）；其余保留源副本，
+//     避免单副本资产搬完被降到 1 份、违背冗余策略；
 //  2. 删除源物理字节——仅当目标盘不在本节点时（跨节点源在他节点，或同节点但 dst 在他盘）；
 //     同节点盘间迁移共享同一 BlobBase/<assetID> 文件，删字节会误伤目标副本，故保留。
-// 源在本节点（srcNode==本节点）时本地直接删除；源在远端时经 HMAC 通知源节点代为释放。
+// 源在本节点（srcNode==本节点）时本地直接删除；源在远端时经 HMAC 通知源节点代为释放，
+// 并明确告知源节点“只释放哪些资产”（门禁决策在本节点完成）。
 func (w *Worker) releaseSource(ctx context.Context, t clusterapi.Task, assets []model.Asset, srcNode string) error {
+	safe := make([]bool, len(assets))
+	for i, a := range assets {
+		safe[i] = w.safeToRelease(a.AssetID, t.SrcDisk)
+	}
+
 	if srcNode == "" || srcNode == w.NodeID {
-		for _, a := range assets {
+		for i, a := range assets {
+			if !safe[i] {
+				continue // 释放后会低于 MinReplicas，保留源副本与字节
+			}
 			if err := w.Repo.DeleteReplica(a.AssetID, t.SrcDisk); err != nil {
 				return err
 			}
-		}
-		if dn, ok := w.Loc.DiskNode(t.DstDisk); !ok || dn != w.NodeID {
-			for _, a := range assets {
+			if dn, ok := w.Loc.DiskNode(t.DstDisk); !ok || dn != w.NodeID {
 				_ = os.Remove(BlobPath(w.BlobBase, a.AssetID))
 			}
 		}
 		return nil
 	}
+
+	// 远端源节点：仅把可安全释放的资产交给它，其余保留在源盘。
+	var toRelease []string
+	for i, a := range assets {
+		if safe[i] {
+			toRelease = append(toRelease, a.AssetID)
+		}
+	}
 	url, ok := w.Loc.PeerURL(srcNode)
 	if !ok {
 		return fmt.Errorf("no peer url for src node %s", srcNode)
 	}
-	return w.Client.ReleaseSource(ctx, url, t.DirKey, t.SrcDisk, t.DstDisk, srcNode)
+	return w.Client.ReleaseSource(ctx, url, t.DirKey, t.SrcDisk, t.DstDisk, srcNode, toRelease)
+}
+
+// safeToRelease 判断删除某资产在 SrcDisk 上的源副本后，剩余有效（HEALTHY）副本数
+// 是否仍 ≥ MinReplicas。注意：DstDisk 副本已在 runMigration 中登记（HEALTHY），
+// 故计数已包含目标副本。MinReplicas<=1 时恒为真（释放后至少保留刚登记的目标副本）。
+// 无法确认（读副本失败）时保守返回 false，保留源副本。
+func (w *Worker) safeToRelease(assetID, srcDisk string) bool {
+	min := w.cfg().MinReplicas
+	if min <= 1 {
+		return true
+	}
+	reps, err := w.Repo.ListReplicas(assetID)
+	if err != nil {
+		return false
+	}
+	n := 0
+	for _, r := range reps {
+		if r.DiskSerial == srcDisk {
+			continue // 即将被删除的源副本不计入
+		}
+		if r.Status == "HEALTHY" {
+			n++
+		}
+	}
+	return n >= min
 }
 
 // runReplica 为某资产在本地 DstDisk 补一份副本；源取一份健康副本所在盘（本节点或远端）。

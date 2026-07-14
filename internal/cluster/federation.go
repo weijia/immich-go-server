@@ -330,14 +330,16 @@ func (c *Client) RehostDirectory(ctx context.Context, baseURL, dirKey, relinquis
 
 // ReleaseSource 经 HMAC 鉴权 POST 通知对端释放源盘（§9.x 真实源盘释放）：
 // 源节点收到后删除其本地源副本记录，并（若 DstDisk 不在该节点）删除物理字节。
-func (c *Client) ReleaseSource(ctx context.Context, baseURL, dirKey, srcDisk, dstDisk, releaseNode string) error {
+// releaseAssets 为空表示释放目录下全部资产；否则仅释放列表中的资产（门禁在调用方决策）。
+func (c *Client) ReleaseSource(ctx context.Context, baseURL, dirKey, srcDisk, dstDisk, releaseNode string, releaseAssets []string) error {
 	path := "/api/cluster/directory/release"
 	body, err := json.Marshal(struct {
-		DirKey      string `json:"dirKey"`
-		SrcDisk     string `json:"srcDisk"`
-		DstDisk     string `json:"dstDisk"`
-		ReleaseNode string `json:"releaseNode"`
-	}{DirKey: dirKey, SrcDisk: srcDisk, DstDisk: dstDisk, ReleaseNode: releaseNode})
+		DirKey        string   `json:"dirKey"`
+		SrcDisk       string   `json:"srcDisk"`
+		DstDisk       string   `json:"dstDisk"`
+		ReleaseNode   string   `json:"releaseNode"`
+		ReleaseAssets []string `json:"releaseAssets,omitempty"`
+	}{DirKey: dirKey, SrcDisk: srcDisk, DstDisk: dstDisk, ReleaseNode: releaseNode, ReleaseAssets: releaseAssets})
 	if err != nil {
 		return err
 	}

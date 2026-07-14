@@ -204,7 +204,7 @@ func TestReleaseSourceClient(t *testing.T) {
 	defer srv.Close()
 
 	c := NewClient("node-B", fedSecret, 60)
-	if err := c.ReleaseSource(context.Background(), srv.URL, "d1", "DA", "DB", "node-A"); err != nil {
+	if err := c.ReleaseSource(context.Background(), srv.URL, "d1", "DA", "DB", "node-A", []string{"a1"}); err != nil {
 		t.Fatalf("ReleaseSource: %v", err)
 	}
 	found := false

@@ -324,10 +324,11 @@ func (h *Handler) handleReleaseSource(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		DirKey      string `json:"dirKey"`
-		SrcDisk     string `json:"srcDisk"`
-		DstDisk     string `json:"dstDisk"`
-		ReleaseNode string `json:"releaseNode"`
+		DirKey        string   `json:"dirKey"`
+		SrcDisk       string   `json:"srcDisk"`
+		DstDisk       string   `json:"dstDisk"`
+		ReleaseNode   string   `json:"releaseNode"`
+		ReleaseAssets []string `json:"releaseAssets,omitempty"` // 可选：仅释放这些资产；空=释放目录下全部
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "bad request", http.StatusBadRequest)
@@ -343,7 +344,21 @@ func (h *Handler) handleReleaseSource(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
+		// 仅保留调用方标记为可安全释放的资产（门禁在 worker 侧决策）。
+		allow := map[string]bool{}
+		if len(req.ReleaseAssets) == 0 {
+			for _, a := range assets { // 空列表=释放全部（向后兼容直接调用）
+				allow[a.AssetID] = true
+			}
+		} else {
+			for _, id := range req.ReleaseAssets {
+				allow[id] = true
+			}
+		}
 		for _, a := range assets {
+			if !allow[a.AssetID] {
+				continue // 释放后会低于 MinReplicas，保留源副本
+			}
 			if err := h.Provider.DeleteReplica(a.AssetID, req.SrcDisk); err != nil {
 				http.Error(w, err.Error(), http.StatusInternalServerError)
 				return
@@ -351,6 +366,9 @@ func (h *Handler) handleReleaseSource(w http.ResponseWriter, r *http.Request) {
 		}
 		if node, ok := h.Provider.GetDiskLocation(req.DstDisk); !ok || node != h.NodeID {
 			for _, a := range assets {
+				if !allow[a.AssetID] {
+					continue
+				}
 				_ = os.Remove(filepath.Join(h.BlobBase, a.AssetID))
 			}
 		}

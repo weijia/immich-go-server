@@ -73,14 +73,21 @@ func TestWorkerLocalMigration(t *testing.T) {
 		t.Fatalf("directory disk not updated: ok=%v disk=%q", ok, dir2.DiskSerial)
 	}
 	reps, _ := st.ListReplicas("a1")
-	found := false
+	foundDB := false
+	foundDA := false
 	for _, r := range reps {
 		if r.DiskSerial == "DB" && r.Status == "HEALTHY" {
-			found = true
+			foundDB = true
+		}
+		if r.DiskSerial == "DA" { // 单副本资产 + MinReplicas=2：源副本应被门禁保留
+			foundDA = true
 		}
 	}
-	if !found {
+	if !foundDB {
 		t.Errorf("missing HEALTHY replica on DB: %+v", reps)
+	}
+	if !foundDA {
+		t.Errorf("single-copy source a1@DA must be retained (MinReplicas=2 gate): %+v", reps)
 	}
 	tasks, _ := st.ListTasks()
 	if len(tasks) != 1 || tasks[0].Status != "DONE" {
