@@ -26,6 +26,8 @@ func newMemFS() *memFS {
 
 func (m *memFS) putSource(assetID string, data []byte) { m.src[assetID] = data }
 
+func (m *memFS) SetExt(assetID, originalPath string) {}
+
 func (m *memFS) StatSource(assetID string) (int64, bool) {
 	d, ok := m.src[assetID]
 	return int64(len(d)), ok

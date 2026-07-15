@@ -15,6 +15,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+
+	"github.com/weijia/immich-go-server/internal/model"
 	"os"
 	"path/filepath"
 	"sort"
@@ -131,10 +133,11 @@ func (g *Ingester) Run(ctx context.Context, srcRoot, blobRoot, mode string) (*Re
 		kind := classify(path)
 
 		destDir := filepath.Join(blobRoot, filepath.FromSlash(dirKey))
-		dest := filepath.Join(destDir, assetID)
+		dest := filepath.Join(destDir, model.PhysNameInDir(assetID, path, destDir))
 
-		// 幂等：目标已存在即同内容已摄入 → 跳过（move 时顺手删源，避免孤儿）
-		if exists(dest) {
+		// 幂等：内容相同（asset_id 相同）即同内容已摄入 → 跳过（move 时顺手删源，避免孤儿）。
+		// 用 ResolvePhysPath 兼容"已带 ext / 未迁移无 ext"两种存量，避免重复落盘。
+		if exists(model.ResolvePhysPath(destDir, assetID, path)) {
 			rep.Skipped++
 			if mode == "move" {
 				_ = os.Remove(path)

@@ -60,7 +60,7 @@ CREATE TABLE device_asset (
 );
 ```
 
-落盘位置：`blob_root/<dir_key>/<asset_id>`，sidecar `blob_root/<dir_key>/.meta.json`（`ingest.MetaFile`，复用 `ingest.FlushMeta` 合并写入、新增 `ingest.RemoveAssetFromMeta` 删除单项）。`dir_key = time.Format("2006/01")`，`asset_id = sha256(内容)`。
+落盘与 `asset_id` 的内部生成规则（内容寻址、目录布局、文件名扩展名等存储实现细节）由存储设计文档规定，**不在本接口契约范围内**。上传成功返回 `AssetResponse`（含 `id`、`type`、`mimeType`、`fileSize`、`originalFileName` 等），客户端以 `id` 引用资产；内部 `asset_id` 与物理文件名对客户端不透明。
 
 ## 4. 关键流程
 

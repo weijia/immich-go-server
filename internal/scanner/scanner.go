@@ -55,7 +55,8 @@ func syncDir(st *store.Store, blobRoot, dirKey, diskSerial, nodeID, metaPath str
 	now := time.Now().Unix()
 	for _, a := range mf.Assets {
 		// 物理存在性校验：缺失则跳过 replica 登记（保留真相，不臆造副本）。
-		phys := filepath.Join(blobRoot, filepath.FromSlash(dirKey), a.AssetID)
+		// ResolvePhysPath 兼容"已带 ext / 未迁移无 ext"两种存量形态。
+		phys := model.ResolvePhysPath(filepath.Join(blobRoot, filepath.FromSlash(dirKey)), a.AssetID, a.OriginalPath)
 		if !exists(phys) {
 			continue
 		}

@@ -141,6 +141,10 @@ func NewRemoteBlobStore(src *RemoteSource, target BlobStore) BlobStore {
 	return &RemoteBlobStore{src: src, tgt: target}
 }
 
+func (r *RemoteBlobStore) SetExt(assetID, originalPath string) {
+	r.tgt.SetExt(assetID, originalPath)
+}
+
 func (r *RemoteBlobStore) StatSource(assetID string) (int64, bool) {
 	return r.src.StatSource(assetID)
 }

@@ -17,6 +17,7 @@ import (
 	"github.com/weijia/immich-go-server/internal/coordinator"
 	"github.com/weijia/immich-go-server/internal/diskid"
 	"github.com/weijia/immich-go-server/internal/diskutil"
+	"github.com/weijia/immich-go-server/internal/ingest"
 	"github.com/weijia/immich-go-server/internal/model"
 	"github.com/weijia/immich-go-server/internal/scanner"
 	"github.com/weijia/immich-go-server/internal/server"
@@ -30,6 +31,11 @@ func main() {
 	blobRoot := envOr("BLOB_ROOT", "./blobs")
 	discover := envOr("DISCOVER_ADDR", "") // 例：239.0.0.1:9999
 	diskDirs := splitList(envOr("DISK_DIRS", ""))
+
+	// 启动迁移：把旧的物理文件名统一为 "<sha256>[_<原始文件名片段>][.<ext>]" 规则。
+	if err := ingest.MigratePhysName(diskDirs); err != nil {
+		log.Printf("migrate phys name: %v", err)
+	}
 	claimGrace := int64(envOrInt("CLAIM_GRACE_SEC", 3600))
 	serverName := envOr("SERVER_NAME", "immich-go-server")
 	serverURL := envOr("SERVER_URL", "")

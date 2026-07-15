@@ -938,9 +938,9 @@ func (h *Handler) uploadAsset(w http.ResponseWriter, r *http.Request) {
 	}
 	dirKey := t.Format("2006/01")
 
-	// 写物理字节 + sidecar（仓库即真相）。
+	// 写物理字节 + sidecar（仓库即真相）。文件名 = 内容寻址 sha256 + 原始文件名片段 + ext（类型可识别）。
 	destDir := filepath.Join(blobRoot, filepath.FromSlash(dirKey))
-	dest := filepath.Join(destDir, assetID)
+	dest := filepath.Join(destDir, model.PhysNameInDir(assetID, f.Filename, destDir))
 	if err := os.MkdirAll(destDir, 0o755); err != nil {
 		http.Error(w, "mkdir: "+err.Error(), http.StatusInternalServerError)
 		return
@@ -1073,7 +1073,7 @@ func (h *Handler) deleteAsset(w http.ResponseWriter, r *http.Request, id string)
 		return
 	}
 	if blobRoot != "" {
-		_ = os.Remove(filepath.Join(blobRoot, filepath.FromSlash(a.DirKey), a.AssetID))
+		_ = os.Remove(model.ResolvePhysPath(filepath.Join(blobRoot, filepath.FromSlash(a.DirKey)), a.AssetID, a.OriginalPath))
 		_ = ingest.RemoveAssetFromMeta(blobRoot, a.DirKey, a.AssetID)
 	}
 	w.WriteHeader(http.StatusNoContent)
@@ -1099,7 +1099,7 @@ func (h *Handler) serveAssetBytes(w http.ResponseWriter, r *http.Request, id, su
 		http.Error(w, "no storage configured", http.StatusInternalServerError)
 		return
 	}
-	phys := filepath.Join(blobRoot, filepath.FromSlash(a.DirKey), a.AssetID)
+	phys := model.ResolvePhysPath(filepath.Join(blobRoot, filepath.FromSlash(a.DirKey)), a.AssetID, a.OriginalPath)
 	f, err := os.Open(phys)
 	if err != nil {
 		http.Error(w, "asset not found", http.StatusNotFound)
@@ -1381,7 +1381,7 @@ func (h *Handler) handleReleaseSource(w http.ResponseWriter, r *http.Request) {
 				if !allow[a.AssetID] {
 					continue
 				}
-				_ = os.Remove(filepath.Join(root, req.DirKey, a.AssetID))
+				_ = os.Remove(model.ResolvePhysPath(filepath.Join(root, req.DirKey), a.AssetID, ""))
 			}
 		}
 	}
@@ -1421,7 +1421,7 @@ func (h *Handler) handleBlob(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "invalid path", http.StatusBadRequest)
 			return
 		}
-		phys := filepath.Join(root, dirKey, assetID)
+		phys := model.ResolvePhysPath(filepath.Join(root, dirKey), assetID, "")
 		fi, serr := os.Stat(phys)
 		if serr != nil {
 			http.Error(w, "blob not found", http.StatusNotFound)
@@ -1479,7 +1479,7 @@ func (h *Handler) handleBlob(w http.ResponseWriter, r *http.Request) {
 		if root == "" {
 			root = h.BlobRoot
 		}
-		f, serr := os.Open(filepath.Join(root, dirKey, assetID))
+		f, serr := os.Open(model.ResolvePhysPath(filepath.Join(root, dirKey), assetID, ""))
 		if serr != nil {
 			http.Error(w, "open failed", http.StatusInternalServerError)
 			return

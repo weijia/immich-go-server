@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/weijia/immich-go-server/internal/config"
@@ -19,6 +20,7 @@ const bufSize = 1 << 20
 // BlobStore 迁移执行所需的 blob 访问抽象（§6.5 执行层）。
 // 生产用 osBlobStore（真实文件系统），测试用内存实现，二者满足同一接口。
 type BlobStore interface {
+	SetExt(assetID, originalPath string) // 记录原路径，使目标写入带上扩展名
 	StatSource(assetID string) (size int64, ok bool)
 	OpenSource(assetID string, offset int64) (io.ReadCloser, error)
 	CreateTarget(assetID string) (io.WriteCloser, error)
@@ -63,6 +65,8 @@ func (e *Executor) Start(srcDisk, dstDisk string, source []model.Asset) (migrati
 
 // CopyFile 按续传动作拷贝单个文件（流式分块），实时更新 manifest 进度。
 func (e *Executor) CopyFile(m *migration.Manifest, f model.Asset, act migration.FileAction) error {
+	// 记录原路径，使目标写入带上扩展名（内容寻址 + 类型可识别）。
+	e.bs.SetExt(f.AssetID, f.OriginalPath)
 	switch act.Mode {
 	case migration.ModeSkip:
 		return nil
@@ -195,17 +199,40 @@ func genTaskID() string {
 type osBlobStore struct {
 	srcRoot string
 	dstRoot string
+	mu      sync.Mutex
+	ext     map[string]string // assetID -> originalPath，供目标写带扩展名
 }
 
 // NewOSBlobStore 构造真实文件系统执行后端。
 func NewOSBlobStore(srcRoot, dstRoot string) BlobStore {
-	return &osBlobStore{srcRoot: srcRoot, dstRoot: dstRoot}
+	return &osBlobStore{srcRoot: srcRoot, dstRoot: dstRoot, ext: map[string]string{}}
 }
 
-func (b *osBlobStore) path(root, assetID string) string { return filepath.Join(root, assetID) }
+// SetExt 记录某 asset 的原路径，使目标写入带上扩展名（内容寻址 + 类型可识别）。
+func (b *osBlobStore) SetExt(assetID, originalPath string) {
+	b.mu.Lock()
+	b.ext[assetID] = originalPath
+	b.mu.Unlock()
+}
+
+// srcPath 源路径：兼容带/不带 ext（迁移源可能是内容寻址带 ext 文件）。
+func (b *osBlobStore) srcPath(assetID string) string {
+	if p, ok := model.FirstMatch(b.srcRoot, assetID); ok {
+		return p
+	}
+	return filepath.Join(b.srcRoot, assetID)
+}
+
+// dstPath 目标路径：内容寻址 sha256 + 原始文件名片段 + ext（无 originalPath 时回退裸 assetID）。
+func (b *osBlobStore) dstPath(assetID string) string {
+	b.mu.Lock()
+	op := b.ext[assetID]
+	b.mu.Unlock()
+	return filepath.Join(b.dstRoot, model.PhysNameInDir(assetID, op, b.dstRoot))
+}
 
 func (b *osBlobStore) StatSource(assetID string) (int64, bool) {
-	fi, err := os.Stat(b.path(b.srcRoot, assetID))
+	fi, err := os.Stat(b.srcPath(assetID))
 	if err != nil {
 		return 0, false
 	}
@@ -213,7 +240,7 @@ func (b *osBlobStore) StatSource(assetID string) (int64, bool) {
 }
 
 func (b *osBlobStore) OpenSource(assetID string, offset int64) (io.ReadCloser, error) {
-	f, err := os.Open(b.path(b.srcRoot, assetID))
+	f, err := os.Open(b.srcPath(assetID))
 	if err != nil {
 		return nil, err
 	}
@@ -227,11 +254,11 @@ func (b *osBlobStore) OpenSource(assetID string, offset int64) (io.ReadCloser, e
 }
 
 func (b *osBlobStore) CreateTarget(assetID string) (io.WriteCloser, error) {
-	return os.Create(b.path(b.dstRoot, assetID))
+	return os.Create(b.dstPath(assetID))
 }
 
 func (b *osBlobStore) OpenTargetAppend(assetID string) (io.WriteCloser, int64, error) {
-	p := b.path(b.dstRoot, assetID)
+	p := b.dstPath(assetID)
 	f, err := os.OpenFile(p, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 	if err != nil {
 		return nil, 0, err
@@ -245,7 +272,7 @@ func (b *osBlobStore) OpenTargetAppend(assetID string) (io.WriteCloser, int64, e
 }
 
 func (b *osBlobStore) RemoveTarget(assetID string) error {
-	err := os.Remove(b.path(b.dstRoot, assetID))
+	err := os.Remove(b.dstPath(assetID))
 	if os.IsNotExist(err) {
 		return nil
 	}
