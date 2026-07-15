@@ -16,3 +16,5 @@
 /data/
 *.db
 *.db-journal
+server.log
+server.err

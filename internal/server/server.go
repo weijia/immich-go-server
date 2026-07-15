@@ -229,12 +229,17 @@ func isLoopbackOrUnspecified(host string) bool {
 	return strings.HasPrefix(host, "127.") || strings.HasPrefix(host, "::1")
 }
 
-// firstNonLoopbackIP 返回本机首个 up 的非回环 IPv4 地址。
+// firstNonLoopbackIP 返回本机一个可达 IPv4 地址，供客户端发现使用。
+// 两遍扫描：第一遍优先返回 RFC1918 私有地址（局域网 Wi-Fi/以太网），并跳过
+// Tailscale/CGNAT（100.64.0.0/10）等虚拟网卡——否则本机会把 tailscale0 的 100.x.x.x
+// 当成服务器地址返回给客户端，而客户端（手机）往往未连接 Tailscale，导致连不上。
+// 若没有任何私有地址（纯 VPN 环境），第二遍兜底返回任意非回环 IPv4。
 func firstNonLoopbackIP() string {
 	ifaces, err := net.Interfaces()
 	if err != nil {
 		return ""
 	}
+	var fallback string
 	for _, iface := range ifaces {
 		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
 			continue
@@ -254,12 +259,37 @@ func firstNonLoopbackIP() string {
 			if ip == nil || ip.IsLoopback() {
 				continue
 			}
-			if v4 := ip.To4(); v4 != nil {
+			v4 := ip.To4()
+			if v4 == nil {
+				continue
+			}
+			if fallback == "" {
+				fallback = v4.String()
+			}
+			if isPrivateV4(v4) && !isCGNAT(v4) {
 				return v4.String()
 			}
 		}
 	}
-	return ""
+	return fallback
+}
+
+// isPrivateV4 判断是否为 RFC1918 私有地址（局域网）。不含 Tailscale/CGNAT(100.64/10)。
+func isPrivateV4(ip net.IP) bool {
+	if v4 := ip.To4(); v4 != nil {
+		return v4[0] == 10 ||
+			(v4[0] == 172 && v4[1] >= 16 && v4[1] <= 31) ||
+			(v4[0] == 192 && v4[1] == 168)
+	}
+	return false
+}
+
+// isCGNAT 判断是否为 100.64.0.0/10（Tailscale 等 Carrier-Grade NAT 虚拟地址）。
+func isCGNAT(ip net.IP) bool {
+	if v4 := ip.To4(); v4 != nil {
+		return v4[0] == 100 && v4[1] >= 64 && v4[1] <= 127
+	}
+	return false
 }
 
 // Store 暴露本地仓储（供 OnTick / 测试使用）。
