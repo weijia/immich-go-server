@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -207,6 +208,10 @@ type Handler struct {
 	// AssetStore 客户端媒体 API 后端（§media-api）；为 nil 时资产路由返回 501。
 	AssetStore AssetBackend
 
+	// DashboardToken 供 WebUI（浏览器端看板）拉取节点信息的访问令牌。
+	// 空则代表不启用 token 校验（不推荐）。
+	DashboardToken string
+
 	mu   sync.Mutex
 	seen map[string]bool
 }
@@ -276,6 +281,11 @@ func (h *Handler) Mux() *http.ServeMux {
 	// 暂不主动推送业务事件（不影响登录与相册浏览）。
 	m.HandleFunc("/api/socket.io/", h.handleSocketIO)
 
+	// ---- WebUI 看板信息端点（浏览器端跨域拉取，token 鉴权）----
+	// 与 /api/cluster/state 返回相同节点状态，但用更轻量的 DashboardToken（启动生成、
+	// 打印在日志）而非集群 HMAC 签名，便于看板从浏览器直接跨域读取。
+	m.HandleFunc("/api/dashboard/state", h.dashboardAuth(h.handleState))
+
 	// ---- Immich 客户端媒体 API（资产上传/列表/下载/删除），不经集群 HMAC 鉴权 ----
 	m.HandleFunc("/api/assets/bulk-upload-check", h.handleBulkUploadCheck)
 	m.HandleFunc("/api/assets", h.handleAssets) // GET 列表 / POST 上传
@@ -311,6 +321,41 @@ func (h *Handler) auth(next http.HandlerFunc) http.HandlerFunc {
 		}
 		next(w, r)
 	}
+}
+
+// dashboardAuth 是 WebUI 看板端点的轻量鉴权：用启动时生成/配置的 DashboardToken
+// 做常量时间比较，避免与集群 HMAC（CLUSTER_SECRET）耦合。token 可从以下任一位置获取：
+//   - Authorization: Bearer <token>
+//   - x-api-key: <token>
+//   - 查询参数 ?token=<token>
+//
+// 若未配置 DashboardToken（空），则放行（不推荐，仅供本地调试）。
+func (h *Handler) dashboardAuth(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if h.DashboardToken == "" {
+			next(w, r)
+			return
+		}
+		tok := dashboardTokenFromRequest(r)
+		if tok == "" || subtle.ConstantTimeCompare([]byte(tok), []byte(h.DashboardToken)) != 1 {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusUnauthorized)
+			_ = json.NewEncoder(w).Encode(map[string]any{"error": "invalid dashboard token"})
+			return
+		}
+		next(w, r)
+	}
+}
+
+// dashboardTokenFromRequest 从请求中提取看板令牌。
+func dashboardTokenFromRequest(r *http.Request) string {
+	if ah := r.Header.Get("Authorization"); strings.HasPrefix(ah, "Bearer ") {
+		return strings.TrimSpace(strings.TrimPrefix(ah, "Bearer "))
+	}
+	if k := r.Header.Get("x-api-key"); k != "" {
+		return k
+	}
+	return r.URL.Query().Get("token")
 }
 
 // ---- Immich 客户端 API（发现/认证引导） ----

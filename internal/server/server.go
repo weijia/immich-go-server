@@ -42,6 +42,10 @@ type Config struct {
 	ServerName         string // 发现响应中的展示名，默认 "immich-go-server"
 	ServerURL          string // 外部可达基址（如 http://192.168.1.5:8081），空则自动推导
 	ClientDiscoverAddr string // 客户端 UDP 发现监听地址，默认 ":2284"，空则禁用
+
+	// DashboardToken 供 WebUI（浏览器端看板）拉取节点信息使用的访问令牌。
+	// 空则启动时自动生成并打印；也可用 DASHBOARD_TOKEN 环境变量固定。
+	DashboardToken string
 }
 
 // Node 单节点运行实例。
@@ -77,6 +81,7 @@ func New(cfg Config) (*Node, error) {
 		return nil, fmt.Errorf("store: %w", err)
 	}
 	h := clusterapi.NewHandler(cfg.NodeID, cfg.Secret, cfg.MaxSkew, st)
+	h.DashboardToken = cfg.DashboardToken
 	if cfg.BlobRoot != "" {
 		h.Source = clusterapi.FileSystemBlobSource{Root: cfg.BlobRoot}
 	}
@@ -144,6 +149,9 @@ func (n *Node) Run(ctx context.Context) error {
 	// HTTP 调试日志：设置 IMMICH_GO_DEBUG=1 记录每个请求的方法/路径/状态/耗时；
 	// 设置 IMMICH_GO_DEBUG=2 额外 dump 请求体与响应体（仅用于排查“server is not reachable”等）。
 	var handler http.Handler = n.api.Mux()
+	// CORS：允许浏览器端 WebUI（通常来自不同源/端口）跨域调用本节点 API，
+	// 并放行 Authorization / x-api-key / Content-Type 等鉴权头。
+	handler = corsMiddleware(handler)
 	if lvl := os.Getenv("IMMICH_GO_DEBUG"); lvl != "" {
 		handler = httpDebugMiddleware(handler, lvl == "2")
 		log.Printf("[HTTP-DEBUG] enabled (level=%s)", lvl)
@@ -481,6 +489,24 @@ func truncate(b []byte, max int) string {
 		return s[:max] + "...(truncated)"
 	}
 	return s
+}
+
+// corsMiddleware 允许跨域访问（浏览器端 WebUI 直连本节点 API 使用）。
+// - 对任意请求的响应附加 Access-Control-* 头；
+// - 对 OPTIONS 预检请求直接返回 204，不再向下游传递。
+func corsMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers",
+			"Authorization, Content-Type, x-api-key, X-Cluster-NodeId, X-Cluster-Timestamp, X-Cluster-Nonce, X-Cluster-Sig")
+		w.Header().Set("Access-Control-Max-Age", "86400")
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 // teeResponseWriter 在把响应写回客户端的同时，把字节复制进 buf（用于调试 dump）。

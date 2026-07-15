@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"log"
 	"os"
@@ -32,6 +34,12 @@ func main() {
 	serverURL := envOr("SERVER_URL", "")
 	clientDiscover := envOr("CLIENT_DISCOVER_ADDR", ":2284") // 空则禁用客户端发现
 
+	// WebUI 看板令牌：DASHBOARD_TOKEN 固定则用之；否则每次启动随机生成并打印。
+	dashboardToken := envOr("DASHBOARD_TOKEN", "")
+	if dashboardToken == "" {
+		dashboardToken = randomHexToken()
+	}
+
 	base := server.Config{
 		NodeID:   nodeID,
 		Secret:   secret,
@@ -42,6 +50,7 @@ func main() {
 		ServerName: serverName,
 		ServerURL: serverURL,
 		ClientDiscoverAddr: clientDiscover,
+		DashboardToken:     dashboardToken,
 	}
 	if len(diskDirs) > 0 {
 		base.OnTick = makeTick(nodeID, diskDirs, claimGrace)
@@ -74,6 +83,8 @@ func main() {
 		}
 	}
 	log.Printf("immich-go-server node %q listening on %s (cluster-discovery=%q, client-discovery-udp=%s)", nodeID, addr, discover, clientDiscover)
+	log.Printf("WebUI 看板令牌 (DASHBOARD_TOKEN): %s", dashboardToken)
+	log.Printf("  WebUI 信息端点: GET /api/dashboard/state  （需带 Authorization: Bearer %s 或 ?token=%s）", dashboardToken, dashboardToken)
 	<-ctx.Done()
 	log.Println("shutting down")
 }
@@ -193,9 +204,6 @@ func envOrInt(key string, def int) int {
 }
 
 func splitList(s string) []string {
-	if strings.TrimSpace(s) == "" {
-		return nil
-	}
 	parts := strings.Split(s, ",")
 	out := make([]string, 0, len(parts))
 	for _, p := range parts {
@@ -204,4 +212,14 @@ func splitList(s string) []string {
 		}
 	}
 	return out
+}
+
+// randomHexToken 生成 32 字节（64 字符）十六进制随机令牌，供 WebUI 看板使用。
+func randomHexToken() string {
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		// rand.Read 仅在系统熵耗尽时失败，极罕见；退化为时间戳兜底（仍可用）。
+		return fmt.Sprintf("%d", time.Now().UnixNano())
+	}
+	return hex.EncodeToString(b)
 }
