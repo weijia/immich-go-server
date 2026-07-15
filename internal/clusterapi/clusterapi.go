@@ -17,6 +17,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/gorilla/websocket"
 	"github.com/weijia/immich-go-server/internal/crypto"
 	"github.com/weijia/immich-go-server/internal/ingest"
 	"github.com/weijia/immich-go-server/internal/model"
@@ -261,12 +262,19 @@ func (h *Handler) Mux() *http.ServeMux {
 	m.HandleFunc("/api/server/config", h.handleServerConfig)
 	m.HandleFunc("/api/auth/login", h.handleLogin)
 	m.HandleFunc("/api/auth/token-exchange", h.handleTokenExchange)
+	m.HandleFunc("/api/auth/validateToken", h.handleValidateToken)
 	m.HandleFunc("/api/users/me/preferences", h.handleGetMyPreferences)
 	m.HandleFunc("/api/users/me", h.handleGetMe)
 
 	// ---- Immich 客户端同步 API（登录后全量同步）----
 	m.HandleFunc("/api/sync/ack", h.handleSyncAck)
 	m.HandleFunc("/api/sync/stream", h.handleSyncStream)
+
+	// ---- Immich 实时通道：socket.io (engine.io v4, websocket transport) ----
+	// 客户端登录后通过 socket_io_client 连接，用于接收资产上传就绪等实时事件。
+	// 这里实现最小 engine.io v4 握手，使客户端显示"已连接"并停止 404 噪声；
+	// 暂不主动推送业务事件（不影响登录与相册浏览）。
+	m.HandleFunc("/api/socket.io/", h.handleSocketIO)
 
 	// ---- Immich 客户端媒体 API（资产上传/列表/下载/删除），不经集群 HMAC 鉴权 ----
 	m.HandleFunc("/api/assets/bulk-upload-check", h.handleBulkUploadCheck)
@@ -416,6 +424,17 @@ func (h *Handler) handleLogin(w http.ResponseWriter, r *http.Request) {
 		"profileImagePath":   "",
 		"shouldChangePassword": false,
 	})
+}
+
+// handleValidateToken 实现 Immich /api/auth/validateToken：AuthGuard 在后台周期性
+// 调用以确认 token 仍有效。返回 200 + {authStatus:true} 即可，避免后台抛 404 错误。
+func (h *Handler) handleValidateToken(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{"authStatus": true})
 }
 
 // handleTokenExchange 实现 v3 发现引导：返回 serverToken + serverId，
@@ -650,6 +669,73 @@ func (h *Handler) syncUser(now string) map[string]any {
 		"profileChangedAt": now,
 		"avatarColor":      "primary",
 	}
+}
+
+// ---- Immich 实时通道：socket.io (engine.io v4) ----
+
+var socketIOUpgrader = websocket.Upgrader{
+	// 移动端跨域直连本节点，放行所有 Origin。
+	CheckOrigin: func(r *http.Request) bool { return true },
+}
+
+// handleSocketIO 实现最小 engine.io v4（仅 websocket transport）。流程：
+//  1. 升级为 websocket 后立即下发 open 包：0{...sid/pingInterval...}
+//  2. 收到客户端 "40"（namespace "/" connect）回应 "40"（connect ack），客户端即认为已连接
+//  3. 双向心跳：客户端 "2"(ping) → 回 "3"(pong)；服务端周期性发 "2" 保活
+//
+// 不主动推送业务事件（无实时资产更新），但足以让客户端建立连接、消除 404 报错。
+func (h *Handler) handleSocketIO(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	conn, err := socketIOUpgrader.Upgrade(w, r, nil)
+	if err != nil {
+		return
+	}
+	defer conn.Close()
+
+	sid := randomAccessToken()
+	open := fmt.Sprintf(
+		`0{"sid":%q,"pingInterval":25000,"pingTimeout":20000,"maxPayload":1000000}`,
+		sid,
+	)
+	_ = conn.WriteMessage(websocket.TextMessage, []byte(open))
+
+	// 周期性服务端心跳，防止客户端因长时间无消息而断线重连。
+	ping := time.NewTicker(20 * time.Second)
+	defer ping.Stop()
+	done := make(chan struct{})
+	go func() {
+		for {
+			select {
+			case <-done:
+				return
+			case <-ping.C:
+				_ = conn.WriteMessage(websocket.TextMessage, []byte("2"))
+			}
+		}
+	}()
+
+	for {
+		_, msg, err := conn.ReadMessage()
+		if err != nil {
+			break
+		}
+		s := string(msg)
+		if len(s) == 0 {
+			continue
+		}
+		switch s[0] {
+		case '2': // 客户端 ping
+			_ = conn.WriteMessage(websocket.TextMessage, []byte("3"))
+		case '4': // 消息帧：客户端 "40" 为 namespace "/" 连接请求
+			if s == "40" {
+				_ = conn.WriteMessage(websocket.TextMessage, []byte("40"))
+			}
+		}
+	}
+	close(done)
 }
 
 // ---- Immich 客户端媒体 API（§media-api） ----

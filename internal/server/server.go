@@ -3,8 +3,10 @@
 package server
 
 import (
+	"bufio"
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -393,6 +395,15 @@ func (r *statusRecorder) Write(b []byte) (int, error) {
 	return n, err
 }
 
+// Hijack 转发到底层 ResponseWriter，使 websocket（engine.io）升级可用。
+// 否则 gorilla/websocket 的 Upgrade 会因 ResponseWriter 不可 Hijack 而返回 500。
+func (r *statusRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	if hj, ok := r.ResponseWriter.(http.Hijacker); ok {
+		return hj.Hijack()
+	}
+	return nil, nil, errors.New("statusRecorder: underlying ResponseWriter is not a Hijacker")
+}
+
 // httpDebugMiddleware 记录每个 HTTP 请求的 方法/路径/查询/状态/耗时；
 // dumpBody=true 时额外把请求体与响应体（截断到 4KB）打印出来，便于排查连通性问题。
 func httpDebugMiddleware(next http.Handler, dumpBody bool) http.Handler {
@@ -451,4 +462,12 @@ type teeResponseWriter struct {
 func (t *teeResponseWriter) Write(b []byte) (int, error) {
 	t.buf.Write(b)
 	return t.ResponseWriter.Write(b)
+}
+
+// Hijack 转发到底层 ResponseWriter，使 websocket（engine.io）升级可用。
+func (t *teeResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	if hj, ok := t.ResponseWriter.(http.Hijacker); ok {
+		return hj.Hijack()
+	}
+	return nil, nil, errors.New("teeResponseWriter: underlying ResponseWriter is not a Hijacker")
 }
