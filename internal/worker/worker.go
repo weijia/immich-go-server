@@ -171,7 +171,9 @@ func (w *Worker) rehost(ctx context.Context, t clusterapi.Task, dir model.Direct
 
 // releaseSource 迁移完成后释放源盘（§9.x 真实源盘释放）：
 //  1. 仅释放"删源后仍满足 MinReplicas"的资产（safeToRelease）；其余保留源副本；
-//  2. 删除源物理字节——按 per-disk 仓库路径 <blobRoot>/<dirKey>/<assetID> 定位；
+//  2. 删除源物理字节——按 per-disk 仓库路径 <blobRoot>/<dirKey>/<物理文件名> 定位；
+//     物理文件名已非裸 assetID（为 <原始名>[_<assetID>][.<ext>]），必须用 ResolvePhysPath
+//     按 sha256 后缀/原始名解析真实路径，否则 os.Remove 找不到文件会静默残留孤儿字节。
 //     同节点同根时共享同一文件，删字节会误伤目标副本，故保留。
 // 源在本节点时本地直接删除；源在远端时经 HMAC 通知源节点代为释放。
 func (w *Worker) releaseSource(ctx context.Context, t clusterapi.Task, assets []model.Asset, srcNode string) error {
@@ -192,7 +194,8 @@ func (w *Worker) releaseSource(ctx context.Context, t clusterapi.Task, assets []
 			// 仅当 dst 不在本节点同根时才删物理字节（避免误删共享文件）
 			if rd := w.sameDiskRoot(t.SrcDisk, t.DstDisk); !rd {
 				if srcRoot != "" && a.DirKey != "" {
-					_ = os.Remove(filepath.Join(srcRoot, a.DirKey, a.AssetID))
+					phys := model.ResolvePhysPath(filepath.Join(srcRoot, a.DirKey), a.AssetID, a.OriginalPath)
+					_ = os.Remove(phys)
 				}
 			}
 		}
