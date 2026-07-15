@@ -82,6 +82,8 @@ func New(cfg Config) (*Node, error) {
 	}
 	h := clusterapi.NewHandler(cfg.NodeID, cfg.Secret, cfg.MaxSkew, st)
 	h.DashboardToken = cfg.DashboardToken
+	h.Version = "0.1.0"
+	h.StartedAt = time.Now().Unix()
 	if cfg.BlobRoot != "" {
 		h.Source = clusterapi.FileSystemBlobSource{Root: cfg.BlobRoot}
 	}

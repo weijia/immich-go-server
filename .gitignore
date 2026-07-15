@@ -18,3 +18,8 @@
 *.db-journal
 server.log
 server.err
+main.exe~
+go.err
+server.exe~
+state.json
+go.log

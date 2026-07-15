@@ -112,6 +112,13 @@ func NewStore(path, nodeID string) (*Store, error) {
 		_ = db.Close()
 		return nil, fmt.Errorf("init schema: %w", err)
 	}
+	// 历史数据兼容（§迁移）：旧版本把 directory.last_eval_at 以纳秒存储，
+	// 新版本统一为 epoch 秒。纳秒值（≈1e18）远大于秒值（≈1e9），不归一会导致
+	// LWW 比较失真、前端 fmtAgo 显示成远古。幂等：转一次后即 < 阈值。
+	if _, err := db.Exec(`UPDATE directory SET last_eval_at = last_eval_at / 1000000000 WHERE last_eval_at > 1000000000000000`); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("migrate last_eval_at: %w", err)
+	}
 	return &Store{db: db, nodeID: nodeID}, nil
 }
 
@@ -126,8 +133,8 @@ func (s *Store) SaveDisk(d model.Disk) error {
 INSERT INTO disk (disk_serial,label,capacity_bytes,free_bytes,tier,mounted_node_id,online_seconds,first_seen_at,last_seen_at,suspect,blob_root)
 VALUES (?,?,?,?,?,?,?,?,?,?,?)
 ON CONFLICT(disk_serial) DO UPDATE SET
-  label=excluded.label, capacity_bytes=excluded.capacity_bytes, free_bytes=excluded.free_bytes,
-  tier=excluded.tier, mounted_node_id=excluded.mounted_node_id, online_seconds=excluded.online_seconds,
+  label=excluded.label, tier=excluded.tier,
+  mounted_node_id=excluded.mounted_node_id, online_seconds=excluded.online_seconds,
   last_seen_at=excluded.last_seen_at, suspect=excluded.suspect`,
 		d.DiskSerial, d.Label, d.CapacityBytes, d.FreeBytes, string(d.Tier),
 		d.MountedNodeID, d.OnlineSeconds, d.FirstSeenAt, d.LastSeenAt, boolToInt(d.Suspect), d.BlobRoot)
@@ -169,6 +176,14 @@ func (s *Store) ListDisks() ([]model.Disk, error) {
 // UpdateFree 写后校正（§5.4(a)）：更新某盘空闲字节。
 func (s *Store) UpdateFree(serial string, freeBytes int64) error {
 	_, err := s.db.Exec(`UPDATE disk SET free_bytes=? WHERE disk_serial=?`, freeBytes, serial)
+	return err
+}
+
+// UpdateSpace 写后校正（§5.4(a)）：更新某盘空闲与总字节。
+// 二者由 diskutil.GetSpace 从操作系统采集，不经由 claimDisk 的 upsert 维护，
+// 以免被认领逻辑覆盖为 0（见 SaveDisk 的 ON CONFLICT 分支）。
+func (s *Store) UpdateSpace(serial string, freeBytes, capacityBytes int64) error {
+	_, err := s.db.Exec(`UPDATE disk SET free_bytes=?, capacity_bytes=? WHERE disk_serial=?`, freeBytes, capacityBytes, serial)
 	return err
 }
 
@@ -281,7 +296,7 @@ WHERE r.asset_id=? AND d.suspect=0`, assetID).Scan(&n)
 // LastEvalAt（==0）则默认取当前时刻，保证本地新写总能胜出。
 func (s *Store) SaveDirectory(dir model.Directory) error {
 	if dir.LastEvalAt == 0 {
-		dir.LastEvalAt = time.Now().UnixNano()
+		dir.LastEvalAt = time.Now().Unix()
 	}
 	_, err := s.db.Exec(`INSERT INTO directory (dir_key,node_id,disk_serial,tier,temperature,total_bytes,access_score,last_eval_at) VALUES (?,?,?,?,?,?,?,?)
 ON CONFLICT(dir_key) DO UPDATE SET node_id=excluded.node_id, disk_serial=excluded.disk_serial, tier=excluded.tier,
@@ -490,10 +505,13 @@ func (s *Store) GetState() clusterapi.StatePayload {
 	for _, d := range disks {
 		out = append(out, clusterapi.DiskState{
 			DiskSerial:    d.DiskSerial,
+			Label:         d.Label,
 			Tier:          string(d.Tier),
 			FreeBytes:     d.FreeBytes,
+			CapacityBytes: d.CapacityBytes,
 			MountedNodeID: d.MountedNodeID,
 			OnlineSeconds: d.OnlineSeconds,
+			BlobRoot:      d.BlobRoot,
 		})
 	}
 	// 目录放置图作为控制面随 /state 上报（§8.6），供对端拉取聚合。
@@ -657,7 +675,7 @@ func (s *Store) SaveUploadedAsset(a model.Asset, diskSerial string, sizeBytes in
 			DiskSerial: diskSerial,
 			Tier:       tier,
 			TotalBytes: sizeBytes,
-			LastEvalAt: time.Now().UnixNano(),
+			LastEvalAt: time.Now().Unix(),
 		}
 		if ok && existing.NodeID == s.nodeID {
 			dir.TotalBytes = existing.TotalBytes + sizeBytes // 累加，而非覆盖

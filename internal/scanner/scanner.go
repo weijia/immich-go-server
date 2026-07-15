@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/weijia/immich-go-server/internal/eval"
 	"github.com/weijia/immich-go-server/internal/ingest"
 	"github.com/weijia/immich-go-server/internal/model"
 	"github.com/weijia/immich-go-server/internal/store"
@@ -51,7 +52,7 @@ func syncDir(st *store.Store, blobRoot, dirKey, diskSerial, nodeID, metaPath str
 	}
 
 	var total int64
-	now := time.Now().UnixNano()
+	now := time.Now().Unix()
 	for _, a := range mf.Assets {
 		// 物理存在性校验：缺失则跳过 replica 登记（保留真相，不臆造副本）。
 		phys := filepath.Join(blobRoot, filepath.FromSlash(dirKey), a.AssetID)
@@ -90,11 +91,14 @@ func syncDir(st *store.Store, blobRoot, dirKey, diskSerial, nodeID, metaPath str
 	if d, ok, _ := st.GetDisk(diskSerial); ok {
 		tier = d.Tier
 	}
+	temp, acc := eval.Evaluate(dirKey, total, now)
 	dir := model.Directory{
 		DirKey:      dirKey,
 		NodeID:      nodeID,
 		DiskSerial:  diskSerial,
 		Tier:        tier,
+		Temperature: temp,
+		AccessScore: acc,
 		TotalBytes:  total,
 		LastEvalAt:  now,
 	}

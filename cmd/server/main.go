@@ -16,6 +16,7 @@ import (
 	"github.com/weijia/immich-go-server/internal/config"
 	"github.com/weijia/immich-go-server/internal/coordinator"
 	"github.com/weijia/immich-go-server/internal/diskid"
+	"github.com/weijia/immich-go-server/internal/diskutil"
 	"github.com/weijia/immich-go-server/internal/model"
 	"github.com/weijia/immich-go-server/internal/scanner"
 	"github.com/weijia/immich-go-server/internal/server"
@@ -167,6 +168,14 @@ func claimDisk(n *server.Node, dir, nodeID string, now, grace int64) error {
 	}
 	if err := n.Store().SaveDisk(disk); err != nil {
 		return fmt.Errorf("save disk: %w", err)
+	}
+	// 采集磁盘真实空间（可用/总字节），与认领逻辑解耦，避免被 upsert 清零。
+	if free, total, serr := diskutil.GetSpace(dir); serr == nil {
+		if uerr := n.Store().UpdateSpace(idFile.DiskID, free, total); uerr != nil {
+			log.Printf("update space %s: %v", idFile.DiskID, uerr)
+		}
+	} else {
+		log.Printf("disk space %s: %v", idFile.DiskID, serr)
 	}
 	claimed, err := n.Store().ClaimOrTouchDisk(idFile.DiskID, nodeID, now, grace)
 	if err != nil {

@@ -28,19 +28,33 @@ import (
 // SignedAt 为签名时刻的 epoch 秒，客户端据此重建签名并校验（§9.5 防篡改）。
 type StatePayload struct {
 	NodeID     string          `json:"nodeId"`
+	Node       *NodeInfo       `json:"node,omitempty"`
 	Disks      []DiskState     `json:"disks"`
 	Directories []DirectoryDTO `json:"directories"`
 	SignedAt   int64           `json:"signedAt,omitempty"`
 	Signature  string          `json:"signature,omitempty"`
 }
 
+// NodeInfo 节点元信息，供 WebUI 看板展示（§dashboard）；不参与集群 HMAC 签名校验。
+type NodeInfo struct {
+	NodeID     string `json:"nodeId"`
+	ServerName string `json:"serverName"`
+	ServerURL  string `json:"serverUrl"`
+	Version    string `json:"version"`
+	StartedAt  int64  `json:"startedAt"`
+	UptimeSec  int64  `json:"uptimeSec"`
+}
+
 // DiskState 状态 payload 中的单盘视图。
 type DiskState struct {
 	DiskSerial    string `json:"diskSerial"`
+	Label         string `json:"label,omitempty"`
 	Tier          string `json:"tier"`
 	FreeBytes     int64  `json:"freeBytes"`
+	CapacityBytes int64  `json:"capacityBytes,omitempty"`
 	MountedNodeID string `json:"mountedNodeId"`
 	OnlineSeconds int64  `json:"onlineSeconds,omitempty"`
+	BlobRoot      string `json:"blobRoot,omitempty"`
 }
 
 // Task 集群任务（§9.2 / §16.1），由 Coordinator 下发。
@@ -211,6 +225,10 @@ type Handler struct {
 	// DashboardToken 供 WebUI（浏览器端看板）拉取节点信息的访问令牌。
 	// 空则代表不启用 token 校验（不推荐）。
 	DashboardToken string
+
+	// Version / StartedAt 供 WebUI 看板展示节点元信息（§dashboard）。
+	Version   string
+	StartedAt int64
 
 	mu   sync.Mutex
 	seen map[string]bool
@@ -1178,6 +1196,15 @@ func (h *Handler) handleState(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	p := h.Provider.GetState()
+	// 节点元信息：供 WebUI 看板展示（§dashboard），不参与集群 HMAC 签名。
+	p.Node = &NodeInfo{
+		NodeID:     h.NodeID,
+		ServerName: h.ServerName,
+		ServerURL:  h.ServerURL,
+		Version:    h.Version,
+		StartedAt:  h.StartedAt,
+		UptimeSec:  h.Now() - h.StartedAt,
+	}
 	// 计算 payload 自带签名（§9.5）：对不含 signature 的 body 做 SignPayload。
 	// SignedAt 一并写入 body，供客户端重建签名（§9.5 防篡改）。
 	p.SignedAt = h.Now()

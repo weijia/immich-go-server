@@ -153,7 +153,7 @@ func (w *Worker) runMigration(ctx context.Context, t clusterapi.Task) error {
 func (w *Worker) rehost(ctx context.Context, t clusterapi.Task, dir model.Directory, srcNode string) error {
 	dir.NodeID = w.NodeID
 	dir.DiskSerial = t.DstDisk
-	dir.LastEvalAt = time.Now().UnixNano() // 本地权威写入：刷新评估时刻（纳秒级），LWW 胜出（§8.6 控制面）
+	dir.LastEvalAt = time.Now().Unix() // 本地权威写入：刷新评估时刻（epoch 秒），LWW 胜出（§8.6 控制面）
 	if err := w.Repo.SaveDirectory(dir); err != nil {
 		return err
 	}
