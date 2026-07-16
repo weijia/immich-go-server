@@ -206,16 +206,22 @@ func (n *Node) Addr() string {
 // 本机首个非回环 IPv4，确保局域网客户端能真正连上。
 func (n *Node) externalURL() string {
 	if n.cfg.ServerURL != "" {
+		log.Printf("[EXT-URL] 使用显式配置的 ServerURL=%s", n.cfg.ServerURL)
 		return strings.TrimRight(n.cfg.ServerURL, "/")
 	}
 	host := listenHost(n.cfg.ListenAddr)
+	log.Printf("[EXT-URL] ListenAddr=%s -> listenHost=%s", n.cfg.ListenAddr, host)
 	if isLoopbackOrUnspecified(host) {
+		// 监听在回环/未指定地址时，需要推导一个客户端可达的外部 IP
 		if ip := firstNonLoopbackIP(); ip != "" {
 			host = ip
 		}
+		log.Printf("[EXT-URL] 监听地址为回环/未指定，推导外部 host=%s", host)
 	}
 	port := listenPort(n.listener.Addr().String())
-	return fmt.Sprintf("http://%s:%s", host, port)
+	url := fmt.Sprintf("http://%s:%s", host, port)
+	log.Printf("[EXT-URL] 最终对外基址=%s", url)
+	return url
 }
 
 func listenHost(addr string) string {
@@ -243,19 +249,25 @@ func isLoopbackOrUnspecified(host string) bool {
 // 两遍扫描：第一遍优先返回 RFC1918 私有地址（局域网 Wi-Fi/以太网），并跳过
 // Tailscale/CGNAT（100.64.0.0/10）等虚拟网卡——否则本机会把 tailscale0 的 100.x.x.x
 // 当成服务器地址返回给客户端，而客户端（手机）往往未连接 Tailscale，导致连不上。
-// 若没有任何私有地址（纯 VPN 环境），第二遍兜底返回任意非回环 IPv4。
+// 若没有任何私有地址（纯 VPN 环境），第二遍兜底返回任意非回环 IPv4（依旧先排除 CGNAT）。
+// 旧实现的 bug：fallback 直接采用"遍历到的第一个非回环 IPv4"，当机器只剩 Tailscale+
+// 链路本地时会把 100.64.x.x 当结果返回，导致客户端连 Tailscale 地址而连不上。这里把
+// fallback 也排除 CGNAT，仅当全网段只有 CGNAT 时才退而求其次（并打 WARN）。
 func firstNonLoopbackIP() string {
 	ifaces, err := net.Interfaces()
 	if err != nil {
+		log.Printf("[EXT-URL-DEBUG] net.Interfaces() 错误: %v", err)
 		return ""
 	}
-	var fallback string
+	var fallback string      // 非回环、非 CGNAT 的兜底（可能是 link-local/public）
+	var cgnatFallback string // 仅在完全没有任何其它地址时才用的 CGNAT(tailscale) 地址
 	for _, iface := range ifaces {
 		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
 			continue
 		}
 		addrs, err := iface.Addrs()
 		if err != nil {
+			log.Printf("[EXT-URL-DEBUG] 网卡 %q 读取地址错误: %v", iface.Name, err)
 			continue
 		}
 		for _, a := range addrs {
@@ -266,22 +278,50 @@ func firstNonLoopbackIP() string {
 			case *net.IPAddr:
 				ip = v.IP
 			}
-			if ip == nil || ip.IsLoopback() {
+			if ip == nil {
 				continue
 			}
 			v4 := ip.To4()
 			if v4 == nil {
+				continue // 跳过 IPv6
+			}
+			if ip.IsLoopback() {
 				continue
+			}
+			kind := "other"
+			switch {
+			case isCGNAT(v4):
+				kind = "CGNAT/tailscale(100.64/10)"
+			case isPrivateV4(v4):
+				kind = "private-RFC1918"
+			case v4[0] == 169 && v4[1] == 254:
+				kind = "link-local(169.254)"
+			}
+			log.Printf("[EXT-URL-DEBUG] 候选 网卡=%q ip=%s 类型=%s", iface.Name, v4.String(), kind)
+			if isCGNAT(v4) {
+				if cgnatFallback == "" {
+					cgnatFallback = v4.String()
+				}
+				continue // 绝不优先返回 tailscale 地址
 			}
 			if fallback == "" {
 				fallback = v4.String()
 			}
-			if isPrivateV4(v4) && !isCGNAT(v4) {
+			if isPrivateV4(v4) {
+				log.Printf("[EXT-URL-DEBUG] -> 选中 %s (RFC1918 私有地址)", v4.String())
 				return v4.String()
 			}
 		}
 	}
-	return fallback
+	if fallback != "" {
+		log.Printf("[EXT-URL-DEBUG] 无 RFC1918 私有地址，兜底返回 %s", fallback)
+		return fallback
+	}
+	if cgnatFallback != "" {
+		log.Printf("[EXT-URL-DEBUG] WARN: 全网段仅剩 CGNAT/tailscale 地址，兜底返回 %s（客户端需连上 Tailscale 才能访问）", cgnatFallback)
+		return cgnatFallback
+	}
+	return ""
 }
 
 // isPrivateV4 判断是否为 RFC1918 私有地址（局域网）。不含 Tailscale/CGNAT(100.64/10)。

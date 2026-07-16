@@ -112,14 +112,67 @@ func NewStore(path, nodeID string) (*Store, error) {
 		_ = db.Close()
 		return nil, fmt.Errorf("init schema: %w", err)
 	}
+	if err := migrateSchema(db); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("migrate schema: %w", err)
+	}
+	return &Store{db: db, nodeID: nodeID}, nil
+}
+
+// migrateSchema 对存量（已存在的旧表）补齐后续版本新增的列，并做数据归一。
+// 注意：CREATE TABLE IF NOT EXISTS 仅"建缺失的表"，不会给已存在的旧表补列，
+// 因此旧库升级时会缺列；这里显式探测并 ALTER 补齐，避免 "no such column" 报错。
+func migrateSchema(db *sql.DB) error {
+	// 后续版本新增的列（旧 schema 可能缺失）。探测不存在再 ALTER，避免对已有列报错。
+	cols := []struct {
+		table, column, def string
+	}{
+		{"directory", "last_eval_at", "INTEGER DEFAULT 0"},
+		{"disk", "blob_root", "TEXT DEFAULT ''"},
+		{"asset", "original_path", "TEXT DEFAULT ''"},
+	}
+	for _, c := range cols {
+		if err := ensureColumn(db, c.table, c.column, c.def); err != nil {
+			return err
+		}
+	}
 	// 历史数据兼容（§迁移）：旧版本把 directory.last_eval_at 以纳秒存储，
 	// 新版本统一为 epoch 秒。纳秒值（≈1e18）远大于秒值（≈1e9），不归一会导致
 	// LWW 比较失真、前端 fmtAgo 显示成远古。幂等：转一次后即 < 阈值。
 	if _, err := db.Exec(`UPDATE directory SET last_eval_at = last_eval_at / 1000000000 WHERE last_eval_at > 1000000000000000`); err != nil {
-		_ = db.Close()
-		return nil, fmt.Errorf("migrate last_eval_at: %w", err)
+		return err
 	}
-	return &Store{db: db, nodeID: nodeID}, nil
+	return nil
+}
+
+// ensureColumn 若 table 中不存在 column 则 ALTER TABLE ADD COLUMN（已有则跳过，
+// 因 SQLite 对重复列会报错）。
+func ensureColumn(db *sql.DB, table, column, def string) error {
+	rows, err := db.Query(`PRAGMA table_info(` + table + `)`)
+	if err != nil {
+		return err
+	}
+	has := false
+	for rows.Next() {
+		var cid int
+		var name, ctype string
+		var notnull, pk int
+		var dflt sql.NullString
+		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
+			rows.Close()
+			return err
+		}
+		if name == column {
+			has = true
+			break
+		}
+	}
+	rows.Close()
+	if has {
+		return nil
+	}
+	_, err = db.Exec(`ALTER TABLE ` + table + ` ADD COLUMN ` + column + ` ` + def)
+	return err
 }
 
 // Close 关闭底层连接。
